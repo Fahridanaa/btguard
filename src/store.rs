@@ -6,7 +6,7 @@
 use std::path::Path;
 
 use anyhow::{Context, Result, bail};
-use rusqlite::{Connection, params};
+use rusqlite::{Connection, ErrorCode, params};
 
 use crate::paths;
 
@@ -14,7 +14,7 @@ use crate::paths;
 pub const SCHEMA_VERSION: i64 = 1;
 
 const SCHEMA_V1: &str = r#"
-CREATE TABLE incidents (
+CREATE TABLE IF NOT EXISTS incidents (
     id             INTEGER PRIMARY KEY,
     at_unix        INTEGER NOT NULL,
     kind           TEXT    NOT NULL,
@@ -25,7 +25,7 @@ CREATE TABLE incidents (
     detail         TEXT,
     journal        TEXT
 );
-CREATE INDEX incidents_at_unix ON incidents(at_unix);
+CREATE INDEX IF NOT EXISTS incidents_at_unix ON incidents(at_unix);
 "#;
 
 /// The incident kinds this tool records. Keep the list in sync with the README.
@@ -34,7 +34,6 @@ pub mod kind {
     pub const SCO_ORPHAN: &str = "sco-orphan";
     pub const PROFILE_CHANGE: &str = "profile-change";
     pub const CODEC_CHANGE: &str = "codec-change";
-    pub const DISCONNECT: &str = "disconnect";
     pub const BALANCE_DRIFT: &str = "balance-drift";
 }
 
@@ -61,6 +60,28 @@ pub struct Store {
     conn: Connection,
 }
 
+/// `PRAGMA journal_mode=WAL` does not use SQLite's busy handler. Two first
+/// opens can collide, so retry while another connection changes the mode.
+fn enable_wal(conn: &Connection) -> Result<()> {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        match conn.execute_batch("PRAGMA journal_mode=WAL;") {
+            Ok(()) => return Ok(()),
+            Err(error) => {
+                let busy = matches!(
+                    error.sqlite_error_code(),
+                    Some(ErrorCode::DatabaseBusy | ErrorCode::DatabaseLocked)
+                );
+                if busy && std::time::Instant::now() < deadline {
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                    continue;
+                }
+                return Err(error).context("enable WAL mode");
+            }
+        }
+    }
+}
+
 impl Store {
     pub fn open_default() -> Result<Self> {
         Self::open(&paths::db_path()?)
@@ -72,8 +93,10 @@ impl Store {
                 .with_context(|| format!("create {}", parent.display()))?;
         }
 
-        let conn = Connection::open(path).with_context(|| format!("open {}", path.display()))?;
-        conn.execute_batch("PRAGMA journal_mode=WAL;")?;
+        let mut conn =
+            Connection::open(path).with_context(|| format!("open {}", path.display()))?;
+        conn.busy_timeout(std::time::Duration::from_secs(5))?;
+        enable_wal(&conn)?;
 
         let version: i64 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
         if version > SCHEMA_VERSION {
@@ -83,8 +106,16 @@ impl Store {
             );
         }
         if version < 1 {
-            conn.execute_batch(SCHEMA_V1)?;
-            conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+            let transaction = conn
+                .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+                .context("start the schema transaction")?;
+            transaction
+                .execute_batch(SCHEMA_V1)
+                .context("create the incident schema")?;
+            transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+            transaction
+                .commit()
+                .context("commit the schema transaction")?;
         }
 
         Ok(Self { conn })
@@ -121,6 +152,46 @@ impl Store {
              END
              WHERE id = ?1",
             params![id, line],
+        )?;
+        Ok(())
+    }
+
+    /// Replace the codec of a row when the codec update arrives after the
+    /// profile change.
+    pub fn update_codec(&self, id: i64, codec: &str) -> Result<()> {
+        self.conn.execute(
+            "UPDATE incidents SET codec = ?2 WHERE id = ?1",
+            params![id, codec],
+        )?;
+        Ok(())
+    }
+
+    /// Turn a codec row into the profile row for the same episode.
+    pub fn promote_to_profile_change(
+        &self,
+        id: i64,
+        profile_before: Option<&str>,
+        profile_after: Option<&str>,
+        codec: Option<&str>,
+        journal: Option<&str>,
+    ) -> Result<()> {
+        self.conn.execute(
+            "UPDATE incidents
+             SET kind = ?2,
+                 profile_before = ?3,
+                 profile_after = ?4,
+                 codec = ?5,
+                 detail = NULL,
+                 journal = COALESCE(?6, journal)
+             WHERE id = ?1",
+            params![
+                id,
+                kind::PROFILE_CHANGE,
+                profile_before,
+                profile_after,
+                codec,
+                journal
+            ],
         )?;
         Ok(())
     }
@@ -249,10 +320,91 @@ mod tests {
     fn a_cutoff_includes_the_boundary() {
         let (_dir, store) = store();
         store
-            .insert(&sample(1_700_000_000, kind::DISCONNECT))
+            .insert(&sample(1_700_000_000, kind::BALANCE_DRIFT))
             .unwrap();
         assert_eq!(store.since(1_700_000_000, 10).unwrap().len(), 1);
         assert!(store.since(1_700_000_001, 10).unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_codec_update_replaces_only_the_codec() {
+        let (_dir, store) = store();
+        let mut incident = sample(1_700_000_000, kind::CODEC_CHANGE);
+        incident.codec = Some("sbc".to_owned());
+        incident.detail = Some("codec sbc -> aac".to_owned());
+        let id = store.insert(&incident).unwrap();
+
+        store.update_codec(id, "aac").unwrap();
+
+        let rows = store.since(0, 10).unwrap();
+        assert_eq!(rows[0].codec.as_deref(), Some("aac"));
+        assert_eq!(rows[0].kind, kind::CODEC_CHANGE);
+        assert_eq!(rows[0].detail.as_deref(), Some("codec sbc -> aac"));
+    }
+
+    #[test]
+    fn a_codec_row_becomes_a_profile_row() {
+        let (_dir, store) = store();
+        let id = store
+            .insert(&sample(1_700_000_000, kind::CODEC_CHANGE))
+            .unwrap();
+
+        store
+            .promote_to_profile_change(
+                id,
+                Some("a2dp-sink-sbc"),
+                Some("a2dp-sink-aac"),
+                Some("aac"),
+                Some("context"),
+            )
+            .unwrap();
+
+        let rows = store.since(0, 10).unwrap();
+        assert_eq!(rows[0].kind, kind::PROFILE_CHANGE);
+        assert_eq!(rows[0].profile_before.as_deref(), Some("a2dp-sink-sbc"));
+        assert_eq!(rows[0].profile_after.as_deref(), Some("a2dp-sink-aac"));
+        assert_eq!(rows[0].codec.as_deref(), Some("aac"));
+        assert_eq!(rows[0].journal.as_deref(), Some("context"));
+    }
+
+    #[test]
+    fn a_partial_schema_is_repaired() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("incidents.db");
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch(SCHEMA_V1).unwrap();
+        drop(conn);
+
+        let store = Store::open(&path).expect("repair the partial schema");
+        assert_eq!(store.summary().unwrap().total, 0);
+
+        let conn = Connection::open(&path).unwrap();
+        let version: i64 = conn
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn two_first_opens_succeed() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = std::sync::Arc::new(dir.path().join("incidents.db"));
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+
+        let handles: Vec<_> = (0..2)
+            .map(|_| {
+                let path = path.clone();
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    Store::open(&path).map(|_| ())
+                })
+            })
+            .collect();
+
+        for handle in handles {
+            handle.join().expect("join").expect("open the store");
+        }
     }
 
     #[test]

@@ -1,6 +1,7 @@
 [Unit]
 Description=Record Bluetooth audio incidents on PipeWire
 After=pipewire.service wireplumber.service
+Wants=pipewire.service wireplumber.service
 
 [Service]
 Type=simple

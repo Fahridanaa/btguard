@@ -86,6 +86,7 @@ dependencies = [
  "anyhow",
  "chrono",
  "clap",
+ "libc",
  "rusqlite",
  "serde_json",
  "tempfile",

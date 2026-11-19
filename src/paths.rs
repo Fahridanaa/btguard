@@ -17,3 +17,13 @@ pub fn app_state_dir() -> Result<PathBuf> {
 pub fn db_path() -> Result<PathBuf> {
     Ok(app_state_dir()?.join("incidents.db"))
 }
+
+/// The last journal cursor the watcher processed. A restart resumes here.
+pub fn journal_cursor_path() -> Result<PathBuf> {
+    Ok(app_state_dir()?.join("journal.cursor"))
+}
+
+/// The single-instance lock for `btguard watch`.
+pub fn watch_lock_path() -> Result<PathBuf> {
+    Ok(app_state_dir()?.join("watch.lock"))
+}

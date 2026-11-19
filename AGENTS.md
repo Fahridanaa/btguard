@@ -44,3 +44,8 @@ One migration at a time. Bump `SCHEMA_VERSION` and add a step. Do not edit
 
 A row must come from a real source: `pw-dump`, the journal or D-Bus. Do not
 infer an incident from a timer.
+
+The store is an incident log, not a transition log. A normal disconnect, and
+the transport lines from a normal teardown, are not incidents and make no row.
+A pending episode may wait for a short correlation window, but the evidence
+for the row must be a real source event.

@@ -3,13 +3,19 @@
 //! Two child processes are the only inputs: `pw-dump --monitor` for the graph
 //! and `journalctl --follow` for Bluetooth lines. Nothing here changes audio
 //! state. Every row comes from one of those two sources.
+//!
+//! The store is an incident log, not a transition log. A normal disconnect,
+//! and the transport lines from a normal teardown, make no row.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufRead, BufReader, Read};
-use std::process::{ChildStdout, Command, Stdio};
-use std::sync::mpsc::{self, Sender};
+use std::os::unix::io::AsRawFd;
+use std::path::{Path, PathBuf};
+use std::process::{Child, ChildStdout, Command, Stdio};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::thread;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
 use serde_json::Value;
@@ -18,84 +24,82 @@ use crate::paths;
 use crate::pw::{self, Card, Node};
 use crate::store::{Incident, Store, kind};
 
-/// How long a journal line stays available for same-second correlation.
-const CONTEXT_SECONDS: i64 = 10;
+/// Attach journal lines within this many seconds of a row.
+const CONTEXT_SECONDS: i64 = 1;
+/// How long the journal buffer keeps lines.
+const CONTEXT_BUFFER_SECONDS: i64 = 10;
 /// Cap on buffered journal lines, in case the journal is noisy.
 const CONTEXT_LINES: usize = 500;
+/// A pending episode waits until the end of the next second, so a teardown
+/// that starts in the next second can cancel it.
+const PENDING_SECONDS: i64 = 2;
 /// A stream that is at least this far below the right channel is corrected.
-/// earbud-balance uses 14 dB; -6 dB is wide enough to catch any real fix.
 const CORRECTED_DB: f64 = -6.0;
-/// A stream that is above this level against the right channel is not
-/// corrected. This covers a flat split and a left-dominant split.
-const FLAT_DB: f64 = -1.0;
+/// A correction that moves toward flat by this much is a deviation.
+const BALANCE_DROP_DB: f64 = 3.0;
+/// Wake this often to flush pending episodes and retry a failed child.
+const RECV_TICK: Duration = Duration::from_millis(250);
+/// Give up after this many short-lived children in a row.
+const MAX_RESTART_FAILURES: usize = 5;
 
 pub fn watch() -> Result<()> {
+    let _lock = WatchLock::acquire(&paths::watch_lock_path()?)?;
     let store = Store::open_default()?;
     eprintln!("btguard watch: database {}", paths::db_path()?.display());
 
     let (sender, receiver) = mpsc::channel();
-
-    let mut monitor = Command::new("pw-dump")
-        .arg("--monitor")
-        .stdout(Stdio::piped())
-        .stderr(Stdio::inherit())
-        .spawn()
-        .context("start pw-dump --monitor; is PipeWire installed?")?;
-    let monitor_out = monitor.stdout.take().context("pw-dump wrote no stdout")?;
-    spawn_monitor_reader(monitor_out, sender.clone());
-
-    let mut journal = match Command::new("journalctl")
-        .args(["--follow", "--output=json", "--no-pager", "-n", "0"])
-        .stdout(Stdio::piped())
-        .stderr(Stdio::inherit())
-        .spawn()
-    {
-        Ok(child) => child,
-        Err(error) => {
-            let _ = monitor.kill();
-            let _ = monitor.wait();
-            return Err(error).context("start journalctl --follow");
-        }
-    };
-    let journal_out = journal
-        .stdout
-        .take()
-        .context("journalctl wrote no stdout")?;
-    spawn_journal_reader(journal_out, sender.clone());
+    let mut sources = Sources::new(
+        sender.clone(),
+        CursorFile::new(paths::journal_cursor_path()?),
+    );
+    sources.start_monitor();
+    sources.start_journal();
     drop(sender);
 
-    eprintln!("btguard watch: watching pw-dump --monitor and journalctl -f");
-
     let mut observer = Observer::new(&store);
-    let outcome = loop {
-        match receiver.recv() {
-            Ok(Event::Monitor(objects)) => {
-                if let Err(error) = observer.on_monitor(&objects, now_unix()) {
-                    break Err(error);
-                }
+    let result = run_loop(&mut observer, &mut sources, receiver);
+    sources.stop();
+    result
+}
+
+fn run_loop(
+    observer: &mut Observer<'_>,
+    sources: &mut Sources,
+    receiver: Receiver<Event>,
+) -> Result<()> {
+    loop {
+        let now = now_unix();
+        observer.flush_pending(now)?;
+        if sources.exhausted() {
+            bail!("could not keep the input processes alive");
+        }
+
+        match receiver.recv_timeout(RECV_TICK) {
+            Ok(Event::Monitor { objects, full }) => {
+                observer.on_monitor(&objects, now_unix(), full)?;
             }
             Ok(Event::Journal(line)) => {
-                if let Err(error) = observer.on_journal(line) {
-                    break Err(error);
+                observer.on_journal(line.clone())?;
+                if let Err(error) = sources.cursor.save_for(&line) {
+                    eprintln!("btguard watch: could not save the journal cursor: {error:#}");
                 }
             }
             Ok(Event::Stopped { source, error }) => {
-                break Err(match error {
-                    Some(error) => anyhow::anyhow!("{source} stopped: {error}"),
-                    None => anyhow::anyhow!("{source} stopped"),
-                });
+                match error {
+                    Some(error) => eprintln!(
+                        "btguard watch: {} stopped: {error}; restarting",
+                        source.name()
+                    ),
+                    None => eprintln!("btguard watch: {} stopped; restarting", source.name()),
+                }
+                sources.restart(source)?;
             }
-            Err(_) => break Err(anyhow::anyhow!("both input readers stopped")),
+            Err(RecvTimeoutError::Timeout) => sources.retry_due(now)?,
+            Err(RecvTimeoutError::Disconnected) => {
+                bail!("both input readers stopped");
+            }
         }
-    };
-
-    // Stop the child that is still running. systemd also kills the cgroup.
-    let _ = monitor.kill();
-    let _ = monitor.wait();
-    let _ = journal.kill();
-    let _ = journal.wait();
-
-    outcome
+    }
 }
 
 fn now_unix() -> i64 {
@@ -105,35 +109,299 @@ fn now_unix() -> i64 {
         .unwrap_or(0)
 }
 
+fn backoff(failures: usize) -> i64 {
+    match failures {
+        0 | 1 => 1,
+        2 => 2,
+        3 => 4,
+        4 => 8,
+        _ => 16,
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Source {
+    Monitor,
+    Journal,
+}
+
+impl Source {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Monitor => "pw-dump",
+            Self::Journal => "journalctl",
+        }
+    }
+}
+
 enum Event {
-    Monitor(Vec<Value>),
+    Monitor {
+        objects: Vec<Value>,
+        full: bool,
+    },
     Journal(JournalLine),
     Stopped {
-        source: &'static str,
+        source: Source,
         error: Option<String>,
     },
+}
+
+struct Input {
+    child: Option<Child>,
+    started_at: i64,
+    used_cursor: bool,
+    retry_at: i64,
+    failures: usize,
+}
+
+impl Input {
+    fn new() -> Self {
+        Self {
+            child: None,
+            started_at: 0,
+            used_cursor: false,
+            retry_at: 0,
+            failures: 0,
+        }
+    }
+}
+
+struct Sources {
+    sender: Sender<Event>,
+    cursor: CursorFile,
+    monitor: Input,
+    journal: Input,
+}
+
+impl Sources {
+    fn new(sender: Sender<Event>, cursor: CursorFile) -> Self {
+        Self {
+            sender,
+            cursor,
+            monitor: Input::new(),
+            journal: Input::new(),
+        }
+    }
+
+    fn start_monitor(&mut self) {
+        if let Some(mut child) = self.monitor.child.take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        match spawn_monitor(self.sender.clone()) {
+            Ok(child) => {
+                self.monitor.child = Some(child);
+                self.monitor.started_at = now_unix();
+                self.monitor.used_cursor = false;
+            }
+            Err(error) => {
+                self.monitor.failures += 1;
+                self.monitor.retry_at = now_unix() + backoff(self.monitor.failures);
+                eprintln!("btguard watch: pw-dump failed to start: {error:#}");
+            }
+        }
+    }
+
+    fn start_journal(&mut self) {
+        if let Some(mut child) = self.journal.child.take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        let cursor = match self.cursor.read() {
+            Ok(cursor) => cursor,
+            Err(error) => {
+                eprintln!("btguard watch: could not read the journal cursor: {error:#}");
+                None
+            }
+        };
+        match spawn_journal(self.sender.clone(), cursor.clone()) {
+            Ok(child) => {
+                self.journal.child = Some(child);
+                self.journal.started_at = now_unix();
+                self.journal.used_cursor = cursor.is_some();
+            }
+            Err(error) => {
+                self.journal.failures += 1;
+                self.journal.retry_at = now_unix() + backoff(self.journal.failures);
+                eprintln!("btguard watch: journalctl failed to start: {error:#}");
+            }
+        }
+    }
+
+    fn restart(&mut self, source: Source) -> Result<()> {
+        let now = now_unix();
+        let (lived, status, used_cursor) = match source {
+            Source::Monitor => {
+                let status = self
+                    .monitor
+                    .child
+                    .take()
+                    .and_then(|mut child| child.wait().ok());
+                (
+                    now - self.monitor.started_at,
+                    status,
+                    self.monitor.used_cursor,
+                )
+            }
+            Source::Journal => {
+                let status = self
+                    .journal
+                    .child
+                    .take()
+                    .and_then(|mut child| child.wait().ok());
+                (
+                    now - self.journal.started_at,
+                    status,
+                    self.journal.used_cursor,
+                )
+            }
+        };
+
+        let failures = {
+            let input = match source {
+                Source::Monitor => &mut self.monitor,
+                Source::Journal => &mut self.journal,
+            };
+            if lived <= 2 {
+                input.failures += 1;
+            } else {
+                input.failures = 0;
+            }
+            input.failures
+        };
+        if failures >= MAX_RESTART_FAILURES {
+            bail!(
+                "{} stopped {failures} times in a row; giving up",
+                source.name()
+            );
+        }
+
+        if source == Source::Journal
+            && used_cursor
+            && lived <= 2
+            && status.map(|status| !status.success()).unwrap_or(false)
+        {
+            eprintln!("btguard watch: journal cursor was rejected; starting at the tail");
+            self.cursor.clear()?;
+        }
+
+        match source {
+            Source::Monitor => self.start_monitor(),
+            Source::Journal => self.start_journal(),
+        }
+        Ok(())
+    }
+
+    fn retry_due(&mut self, now: i64) -> Result<()> {
+        if self.monitor.child.is_none() && now >= self.monitor.retry_at {
+            self.start_monitor();
+        }
+        if self.journal.child.is_none() && now >= self.journal.retry_at {
+            self.start_journal();
+        }
+        Ok(())
+    }
+
+    fn exhausted(&self) -> bool {
+        (self.monitor.child.is_none() && self.monitor.failures >= MAX_RESTART_FAILURES)
+            || (self.journal.child.is_none() && self.journal.failures >= MAX_RESTART_FAILURES)
+    }
+
+    fn stop(&mut self) {
+        for input in [&mut self.monitor, &mut self.journal] {
+            if let Some(mut child) = input.child.take() {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+        }
+    }
+}
+
+impl Drop for Sources {
+    fn drop(&mut self) {
+        self.stop();
+    }
+}
+
+fn spawn_monitor(sender: Sender<Event>) -> Result<Child> {
+    let mut child = Command::new("pw-dump")
+        .arg("--monitor")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::inherit())
+        .spawn()
+        .context("start pw-dump --monitor; is PipeWire installed?")?;
+    let stdout = match child.stdout.take() {
+        Some(stdout) => stdout,
+        None => {
+            let _ = child.kill();
+            let _ = child.wait();
+            bail!("pw-dump wrote no stdout");
+        }
+    };
+    spawn_monitor_reader(stdout, sender);
+    Ok(child)
+}
+
+fn spawn_journal(sender: Sender<Event>, cursor: Option<String>) -> Result<Child> {
+    let mut command = Command::new("journalctl");
+    command.args(journal_args(cursor.as_deref()));
+
+    let mut child = command
+        .stdout(Stdio::piped())
+        .stderr(Stdio::inherit())
+        .spawn()
+        .context("start journalctl --follow")?;
+    let stdout = match child.stdout.take() {
+        Some(stdout) => stdout,
+        None => {
+            let _ = child.kill();
+            let _ = child.wait();
+            bail!("journalctl wrote no stdout");
+        }
+    };
+    spawn_journal_reader(stdout, sender);
+    Ok(child)
+}
+
+/// Resume after the saved cursor. A first run starts at the live tail.
+fn journal_args(cursor: Option<&str>) -> Vec<String> {
+    let mut args = vec![
+        "--follow".to_owned(),
+        "--output=json".to_owned(),
+        "--no-pager".to_owned(),
+    ];
+    match cursor {
+        Some(cursor) => args.push(format!("--after-cursor={cursor}")),
+        None => {
+            args.push("-n".to_owned());
+            args.push("0".to_owned());
+        }
+    }
+    args
 }
 
 fn spawn_monitor_reader(stdout: ChildStdout, sender: Sender<Event>) {
     thread::spawn(move || {
         let mut reader = JsonArrayReader::new(stdout);
+        let mut full = true;
         loop {
             match reader.next_array() {
                 Ok(Some(objects)) => {
-                    if sender.send(Event::Monitor(objects)).is_err() {
+                    if sender.send(Event::Monitor { objects, full }).is_err() {
                         return;
                     }
+                    full = false;
                 }
                 Ok(None) => {
                     let _ = sender.send(Event::Stopped {
-                        source: "pw-dump",
+                        source: Source::Monitor,
                         error: None,
                     });
                     return;
                 }
                 Err(error) => {
                     let _ = sender.send(Event::Stopped {
-                        source: "pw-dump",
+                        source: Source::Monitor,
                         error: Some(format!("{error:#}")),
                     });
                     return;
@@ -151,7 +419,7 @@ fn spawn_journal_reader(stdout: ChildStdout, sender: Sender<Event>) {
                 Ok(raw) => raw,
                 Err(error) => {
                     let _ = sender.send(Event::Stopped {
-                        source: "journalctl",
+                        source: Source::Journal,
                         error: Some(error.to_string()),
                     });
                     return;
@@ -161,18 +429,17 @@ fn spawn_journal_reader(stdout: ChildStdout, sender: Sender<Event>) {
                 continue;
             }
             match JournalLine::parse(&raw) {
-                Ok(Some(line)) => {
+                Ok(line) => {
                     if sender.send(Event::Journal(line)).is_err() {
                         return;
                     }
                 }
-                Ok(None) => {}
                 Err(error) => eprintln!("btguard watch: skip a journal line: {error:#}"),
             }
         }
 
         let _ = sender.send(Event::Stopped {
-            source: "journalctl",
+            source: Source::Journal,
             error: None,
         });
     });
@@ -262,29 +529,33 @@ impl<R: Read> JsonArrayReader<R> {
     }
 }
 
-/// One Bluetooth-relevant line from `journalctl --output=json`.
+/// One journal line from `journalctl --output=json`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct JournalLine {
     pub at_unix: i64,
     pub identifier: String,
     pub message: String,
+    pub cursor: Option<String>,
+    pub relevant: bool,
 }
 
 impl JournalLine {
-    fn parse(raw: &str) -> Result<Option<Self>> {
+    fn parse(raw: &str) -> Result<Self> {
         let value: Value = serde_json::from_str(raw).context("journalctl did not write JSON")?;
         let message = message_text(&value);
         let identifier = identifier_text(&value);
+        let relevant = is_bluetooth_relevant(&identifier, &message);
 
-        if !is_bluetooth_relevant(&identifier, &message) {
-            return Ok(None);
-        }
-
-        Ok(Some(Self {
+        Ok(Self {
             at_unix: timestamp_seconds(&value).unwrap_or_else(now_unix),
             identifier,
             message,
-        }))
+            cursor: value
+                .get("__CURSOR")
+                .and_then(Value::as_str)
+                .map(str::to_owned),
+            relevant,
+        })
     }
 
     fn incident_kind(&self) -> Option<&'static str> {
@@ -348,8 +619,7 @@ fn timestamp_seconds(value: &Value) -> Option<i64> {
 }
 
 /// Keep the lines that give Bluetooth context. The transport failure itself
-/// is a WirePlumber line (`spa.bluez5:`), not a bluetoothd line, so that
-/// identifier must be included too.
+/// is a WirePlumber line (`spa.bluez5:`), not a bluetoothd line.
 fn is_bluetooth_relevant(identifier: &str, message: &str) -> bool {
     match identifier {
         "bluetoothd" => true,
@@ -382,6 +652,110 @@ fn bluetooth_device(message: &str) -> Option<String> {
     Some(format!("bluez_card.{}", address.to_ascii_uppercase()))
 }
 
+struct CursorFile {
+    path: PathBuf,
+    last_saved: Option<String>,
+    last_saved_at: i64,
+}
+
+impl CursorFile {
+    fn new(path: PathBuf) -> Self {
+        Self {
+            path,
+            last_saved: None,
+            last_saved_at: 0,
+        }
+    }
+
+    fn read(&mut self) -> Result<Option<String>> {
+        match fs::read_to_string(&self.path) {
+            Ok(text) => {
+                let text = text.trim();
+                if text.is_empty() {
+                    self.last_saved = None;
+                    Ok(None)
+                } else {
+                    self.last_saved = Some(text.to_owned());
+                    Ok(Some(text.to_owned()))
+                }
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                self.last_saved = None;
+                Ok(None)
+            }
+            Err(error) => Err(error).with_context(|| format!("read {}", self.path.display())),
+        }
+    }
+
+    fn save_for(&mut self, line: &JournalLine) -> Result<()> {
+        let Some(cursor) = &line.cursor else {
+            return Ok(());
+        };
+        if self.last_saved.as_deref() == Some(cursor.as_str()) {
+            return Ok(());
+        }
+        if line.relevant || self.last_saved.is_none() || line.at_unix - self.last_saved_at >= 1 {
+            self.write(cursor)?;
+            self.last_saved = Some(cursor.clone());
+            self.last_saved_at = line.at_unix;
+        }
+        Ok(())
+    }
+
+    fn write(&self, cursor: &str) -> Result<()> {
+        if let Some(parent) = self.path.parent() {
+            fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
+        }
+        let temp = self.path.with_extension("cursor.tmp");
+        fs::write(&temp, cursor).with_context(|| format!("write {}", temp.display()))?;
+        fs::rename(&temp, &self.path)
+            .with_context(|| format!("rename {} to {}", temp.display(), self.path.display()))?;
+        Ok(())
+    }
+
+    fn clear(&mut self) -> Result<()> {
+        self.last_saved = None;
+        self.last_saved_at = 0;
+        match fs::remove_file(&self.path) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error).with_context(|| format!("remove {}", self.path.display())),
+        }
+    }
+}
+
+/// One instance of `btguard watch` per state directory.
+#[derive(Debug)]
+pub struct WatchLock {
+    _file: File,
+}
+
+impl WatchLock {
+    pub fn acquire(path: &Path) -> Result<Self> {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
+        }
+        let file = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(path)
+            .with_context(|| format!("open {}", path.display()))?;
+        let result = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+        if result != 0 {
+            let error = io::Error::last_os_error();
+            if error.kind() == io::ErrorKind::WouldBlock {
+                bail!(
+                    "another btguard watch is already running (lock {})",
+                    path.display()
+                );
+            }
+            return Err(error).with_context(|| format!("lock {}", path.display()));
+        }
+        Ok(Self { _file: file })
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Link {
     output_node: u64,
@@ -405,10 +779,34 @@ struct CardState {
     connection: Option<String>,
 }
 
-struct CardContext {
-    device: Option<String>,
-    profile: Option<String>,
-    codec: Option<String>,
+#[derive(Debug, Clone)]
+struct RecentRow {
+    at_unix: i64,
+    id: i64,
+    kind: String,
+    from_journal: bool,
+}
+
+#[derive(Debug, Clone)]
+struct RecentCardRow {
+    card_id: u64,
+    at_unix: i64,
+    id: i64,
+}
+
+#[derive(Debug, Clone)]
+struct Pending {
+    card_id: u64,
+    at_unix: i64,
+    deadline: i64,
+    incident: Incident,
+    from_journal: bool,
+}
+
+#[derive(Debug, Clone)]
+struct StreamLevels {
+    volumes: Vec<f64>,
+    map: Vec<String>,
 }
 
 pub struct Observer<'a> {
@@ -417,18 +815,23 @@ pub struct Observer<'a> {
     nodes: HashMap<u64, Node>,
     links: HashMap<u64, Link>,
     default_sink: Option<String>,
-    /// Relevant journal lines, newest last, pruned to `CONTEXT_SECONDS`.
+    /// Relevant journal lines, newest last, pruned to `CONTEXT_BUFFER_SECONDS`.
     journal: VecDeque<(i64, String)>,
-    /// Incident ids recorded at each second, for journal backfill.
-    recent: HashMap<i64, Vec<i64>>,
-    /// One journal-driven row per kind per second, so a burst is one row.
-    journal_rows: HashMap<(i64, &'static str), i64>,
-    /// Per-stream channel volumes from the previous update.
-    volumes: HashMap<u64, Vec<f64>>,
+    /// Rows written in the last few seconds, for journal backfill.
+    recent: Vec<RecentRow>,
+    /// One open episode per card, waiting for the teardown window.
+    pending: Vec<Pending>,
+    /// Card removals in the last few seconds, to classify teardown lines.
+    disconnects: Vec<(u64, i64)>,
+    /// Per-stream channel levels from the previous update.
+    volumes: HashMap<u64, StreamLevels>,
     /// The last usable profile per card. `off` is teardown, not audio.
     last_profiles: HashMap<u64, String>,
     /// The last codec per card. A removed sink must not erase it.
     last_codecs: HashMap<u64, String>,
+    /// Profile and codec rows that a later event can still fold into.
+    profile_rows: Vec<RecentCardRow>,
+    codec_rows: Vec<RecentCardRow>,
     initialized: bool,
 }
 
@@ -441,24 +844,57 @@ impl<'a> Observer<'a> {
             links: HashMap::new(),
             default_sink: None,
             journal: VecDeque::new(),
-            recent: HashMap::new(),
-            journal_rows: HashMap::new(),
+            recent: Vec::new(),
+            pending: Vec::new(),
+            disconnects: Vec::new(),
             volumes: HashMap::new(),
             last_profiles: HashMap::new(),
             last_codecs: HashMap::new(),
+            profile_rows: Vec::new(),
+            codec_rows: Vec::new(),
             initialized: false,
         }
     }
 
-    /// Apply one array from `pw-dump --monitor`. The first array is the whole
-    /// graph and only sets the baseline; it must not record incidents.
-    pub fn on_monitor(&mut self, objects: &[Value], at_unix: i64) -> Result<()> {
+    /// Apply one array from `pw-dump --monitor`.
+    ///
+    /// The first array of each process is a full snapshot. The first snapshot
+    /// of the watcher only sets the baseline. A later snapshot reconciles the
+    /// graph, so a PipeWire restart is handled without a stale card.
+    pub fn on_monitor(&mut self, objects: &[Value], at_unix: i64, full: bool) -> Result<()> {
         let before = self.card_states();
         let before_sink = self.default_sink.clone();
         let before_volumes = self.volumes.clone();
+        let raw_before: HashMap<u64, Option<String>> = self
+            .cards
+            .iter()
+            .map(|(id, card)| (*id, card.profile.clone()))
+            .collect();
 
+        if full && self.initialized {
+            self.reconcile(objects);
+        }
         for object in objects {
             self.apply(object);
+        }
+
+        let mut off_cards = Vec::new();
+        let mut off_ended = Vec::new();
+        for (id, card) in &self.cards {
+            let was_off = raw_before.get(id).and_then(|profile| profile.as_deref()) == Some("off");
+            let is_off = card.profile.as_deref() == Some("off");
+            let disconnected = card.connection.as_deref() == Some("disconnected");
+            if !was_off && is_off && !disconnected {
+                off_cards.push(card.clone());
+            } else if was_off && !is_off {
+                off_ended.push(*id);
+            }
+        }
+        for card in off_cards {
+            self.start_off_pending(&card, at_unix);
+        }
+        for id in off_ended {
+            self.cancel_pending(id, at_unix);
         }
 
         let after = self.card_states();
@@ -497,53 +933,92 @@ impl<'a> Observer<'a> {
         Ok(())
     }
 
-    /// Apply one journal line. A transport failure or an orphan SCO packet
-    /// records a row; every other relevant line is context for the same second.
+    /// Apply one journal line. Only a deviation makes a row.
     pub fn on_journal(&mut self, line: JournalLine) -> Result<()> {
+        if !line.relevant {
+            return Ok(());
+        }
         self.push_journal(&line);
 
-        let Some(incident_kind) = line.incident_kind() else {
+        let Some(trigger) = line.incident_kind() else {
             self.append_to_recent(line.at_unix, &line.message, None)?;
             self.prune(line.at_unix);
             return Ok(());
         };
 
-        let existing = self
-            .journal_rows
-            .get(&(line.at_unix, incident_kind))
-            .copied();
-        let row_id = match existing {
-            Some(id) => {
-                self.store.append_journal(id, &line.message)?;
-                id
-            }
-            None => {
-                let context = self.card_context(line.device());
-                let journal = self.context(line.at_unix);
-                let id = self.record(Incident {
-                    at_unix: line.at_unix,
-                    kind: incident_kind.to_owned(),
-                    device: context.device,
-                    profile_before: None,
-                    profile_after: context.profile,
-                    codec: context.codec,
-                    detail: None,
-                    journal,
-                })?;
-                self.journal_rows.insert((line.at_unix, incident_kind), id);
-                eprintln!(
-                    "btguard watch: {incident_kind} from {} at {}",
-                    line.identifier,
-                    local_time(line.at_unix)
-                );
-                id
-            }
+        let Some(card_id) = self.card_for_line(&line) else {
+            // A teardown line after the card is gone, or an ambiguous line.
+            self.append_to_recent(line.at_unix, &line.message, None)?;
+            self.prune(line.at_unix);
+            return Ok(());
         };
 
-        // The row above already has this line. Add it to the other incidents
-        // of the same second, such as a profile change.
-        self.append_to_recent(line.at_unix, &line.message, Some(row_id))?;
+        if let Some(row) = self.recent_journal_row(trigger, line.at_unix) {
+            self.store.append_journal(row.id, &line.message)?;
+            self.append_to_recent(line.at_unix, &line.message, Some(row.id))?;
+            self.prune(line.at_unix);
+            return Ok(());
+        }
+
+        if let Some(row) = self.recent_profile_row(card_id, line.at_unix) {
+            self.store.append_journal(row.id, &line.message)?;
+            self.append_to_recent(line.at_unix, &line.message, Some(row.id))?;
+            self.prune(line.at_unix);
+            return Ok(());
+        }
+
+        if self.has_pending(card_id, line.at_unix) {
+            // The pending episode already covers this line, and its journal is
+            // rebuilt from the buffer when it is written.
+            self.append_to_recent(line.at_unix, &line.message, None)?;
+            self.prune(line.at_unix);
+            return Ok(());
+        }
+
+        if self.recent_disconnect(card_id, line.at_unix) {
+            // A normal teardown line is not an incident.
+            self.append_to_recent(line.at_unix, &line.message, None)?;
+            self.prune(line.at_unix);
+            return Ok(());
+        }
+
+        self.start_transport_pending(card_id, trigger, line.at_unix);
+        self.append_to_recent(line.at_unix, &line.message, None)?;
         self.prune(line.at_unix);
+        Ok(())
+    }
+
+    /// Write every pending episode whose teardown window has closed.
+    pub fn flush_pending(&mut self, now_unix: i64) -> Result<()> {
+        let mut keep = Vec::new();
+        let pending_episodes = std::mem::take(&mut self.pending);
+        for mut pending in pending_episodes {
+            if now_unix >= pending.deadline {
+                pending.incident.journal = self.context(pending.incident.at_unix);
+                let id = self.store.insert(&pending.incident)?;
+                self.recent.push(RecentRow {
+                    at_unix: pending.incident.at_unix,
+                    id,
+                    kind: pending.incident.kind.clone(),
+                    from_journal: pending.from_journal,
+                });
+                if pending.incident.kind == kind::PROFILE_CHANGE {
+                    self.profile_rows.push(RecentCardRow {
+                        card_id: pending.card_id,
+                        at_unix: pending.incident.at_unix,
+                        id,
+                    });
+                }
+                eprintln!(
+                    "btguard watch: {} at {}",
+                    pending.incident.kind,
+                    local_time(pending.incident.at_unix)
+                );
+            } else {
+                keep.push(pending);
+            }
+        }
+        self.pending = keep;
         Ok(())
     }
 
@@ -599,6 +1074,16 @@ impl<'a> Observer<'a> {
         }
     }
 
+    fn reconcile(&mut self, objects: &[Value]) {
+        let present: HashSet<u64> = objects
+            .iter()
+            .filter_map(|object| object.get("id").and_then(Value::as_u64))
+            .collect();
+        self.cards.retain(|id, _| present.contains(id));
+        self.nodes.retain(|id, _| present.contains(id));
+        self.links.retain(|id, _| present.contains(id));
+    }
+
     fn card_states(&self) -> HashMap<u64, CardState> {
         self.cards
             .iter()
@@ -617,7 +1102,10 @@ impl<'a> Observer<'a> {
                             .get(id)
                             .cloned()
                             .or_else(|| self.card_codec(card)),
-                        connection: card.connection.clone(),
+                        connection: card
+                            .connection
+                            .clone()
+                            .or_else(|| Some("connected".to_owned())),
                     },
                 )
             })
@@ -652,30 +1140,19 @@ impl<'a> Observer<'a> {
 
         for (id, old) in before {
             let new = after.get(id);
-            let name = new
-                .map(|state| state.name.clone())
-                .unwrap_or_else(|| old.name.clone());
-
             let disconnected = match new {
                 Some(new) => {
-                    old.connection.as_deref() == Some("connected")
+                    old.connection.as_deref() != Some("disconnected")
                         && new.connection.as_deref() == Some("disconnected")
                 }
-                None => old.connection.as_deref() == Some("connected"),
+                None => true,
             };
 
             if disconnected {
-                let journal = self.context(at_unix);
-                self.record(Incident {
-                    at_unix,
-                    kind: kind::DISCONNECT.to_owned(),
-                    device: Some(old.name.clone()),
-                    profile_before: old.profile.clone(),
-                    profile_after: None,
-                    codec: old.codec.clone(),
-                    detail: Some("Bluetooth card disconnected".to_owned()),
-                    journal,
-                })?;
+                // A normal disconnect is not an incident. It cancels a
+                // teardown episode but keeps a real deviation row.
+                self.cancel_pending(*id, at_unix);
+                self.disconnects.push((*id, at_unix));
                 eprintln!("btguard watch: disconnected {}", old.name);
                 continue;
             }
@@ -684,55 +1161,16 @@ impl<'a> Observer<'a> {
                 continue;
             };
 
-            // `off` is the card's teardown state, not an audio profile. A
-            // disconnect and a reconnect pass through it; the disconnect row
-            // and the connect log already describe those transitions.
-            if old.profile != new.profile
+            let profile_changed = old.profile != new.profile
                 && old.profile.as_deref() != Some("off")
-                && new.profile.as_deref() != Some("off")
-            {
-                let journal = self.context(at_unix);
-                self.record(Incident {
-                    at_unix,
-                    kind: kind::PROFILE_CHANGE.to_owned(),
-                    device: Some(name.clone()),
-                    profile_before: old.profile.clone(),
-                    profile_after: new.profile.clone(),
-                    codec: new.codec.clone(),
-                    detail: None,
-                    journal,
-                })?;
-                eprintln!(
-                    "btguard watch: profile {}: {} -> {}",
-                    name,
-                    old.profile.as_deref().unwrap_or("unknown"),
-                    new.profile.as_deref().unwrap_or("unknown")
-                );
+                && new.profile.as_deref() != Some("off");
+            if profile_changed {
+                self.record_profile_change(*id, old, new, at_unix)?;
                 continue;
             }
 
             if old.codec.is_some() && new.codec.is_some() && old.codec != new.codec {
-                let journal = self.context(at_unix);
-                self.record(Incident {
-                    at_unix,
-                    kind: kind::CODEC_CHANGE.to_owned(),
-                    device: Some(name.clone()),
-                    profile_before: None,
-                    profile_after: new.profile.clone(),
-                    codec: new.codec.clone(),
-                    detail: Some(format!(
-                        "codec {} -> {}",
-                        old.codec.as_deref().unwrap_or("unknown"),
-                        new.codec.as_deref().unwrap_or("unknown")
-                    )),
-                    journal,
-                })?;
-                eprintln!(
-                    "btguard watch: codec {}: {} -> {}",
-                    name,
-                    old.codec.as_deref().unwrap_or("unknown"),
-                    new.codec.as_deref().unwrap_or("unknown")
-                );
+                self.record_codec_change(*id, old, new, at_unix)?;
             }
         }
 
@@ -749,9 +1187,145 @@ impl<'a> Observer<'a> {
         Ok(())
     }
 
+    fn record_profile_change(
+        &mut self,
+        card_id: u64,
+        old: &CardState,
+        new: &CardState,
+        at_unix: i64,
+    ) -> Result<()> {
+        self.cancel_pending(card_id, at_unix);
+        let journal = self.context(at_unix);
+
+        if let Some(codec_row) = self.recent_codec_row(card_id, at_unix).cloned() {
+            self.store.promote_to_profile_change(
+                codec_row.id,
+                old.profile.as_deref(),
+                new.profile.as_deref(),
+                new.codec.as_deref(),
+                journal.as_deref(),
+            )?;
+            self.codec_rows.retain(|row| row.id != codec_row.id);
+            self.recent.retain(|row| row.id != codec_row.id);
+            self.recent.push(RecentRow {
+                at_unix: codec_row.at_unix,
+                id: codec_row.id,
+                kind: kind::PROFILE_CHANGE.to_owned(),
+                from_journal: false,
+            });
+            self.profile_rows.push(RecentCardRow {
+                card_id,
+                at_unix: codec_row.at_unix,
+                id: codec_row.id,
+            });
+            eprintln!(
+                "btguard watch: profile {}: {} -> {} (folded with the codec row)",
+                new.name,
+                old.profile.as_deref().unwrap_or("unknown"),
+                new.profile.as_deref().unwrap_or("unknown")
+            );
+            return Ok(());
+        }
+
+        let incident = Incident {
+            at_unix,
+            kind: kind::PROFILE_CHANGE.to_owned(),
+            device: Some(new.name.clone()),
+            profile_before: old.profile.clone(),
+            profile_after: new.profile.clone(),
+            codec: new.codec.clone(),
+            detail: None,
+            journal,
+        };
+        let id = self.store.insert(&incident)?;
+        self.recent.push(RecentRow {
+            at_unix,
+            id,
+            kind: kind::PROFILE_CHANGE.to_owned(),
+            from_journal: false,
+        });
+        self.profile_rows.push(RecentCardRow {
+            card_id,
+            at_unix,
+            id,
+        });
+        eprintln!(
+            "btguard watch: profile {}: {} -> {}",
+            new.name,
+            old.profile.as_deref().unwrap_or("unknown"),
+            new.profile.as_deref().unwrap_or("unknown")
+        );
+        Ok(())
+    }
+
+    fn record_codec_change(
+        &mut self,
+        card_id: u64,
+        old: &CardState,
+        new: &CardState,
+        at_unix: i64,
+    ) -> Result<()> {
+        let Some(codec) = new.codec.as_deref() else {
+            return Ok(());
+        };
+
+        if let Some(profile_row) = self.recent_profile_row(card_id, at_unix) {
+            self.store.update_codec(profile_row.id, codec)?;
+            return Ok(());
+        }
+
+        if let Some(pending) = self
+            .pending
+            .iter_mut()
+            .find(|pending| pending.card_id == card_id && (pending.at_unix - at_unix).abs() <= 1)
+        {
+            pending.incident.codec = Some(codec.to_owned());
+            return Ok(());
+        }
+
+        if let Some(codec_row) = self.recent_codec_row(card_id, at_unix).cloned() {
+            self.store.update_codec(codec_row.id, codec)?;
+            return Ok(());
+        }
+
+        let incident = Incident {
+            at_unix,
+            kind: kind::CODEC_CHANGE.to_owned(),
+            device: Some(new.name.clone()),
+            profile_before: None,
+            profile_after: new.profile.clone(),
+            codec: Some(codec.to_owned()),
+            detail: Some(format!(
+                "codec {} -> {}",
+                old.codec.as_deref().unwrap_or("unknown"),
+                codec
+            )),
+            journal: self.context(at_unix),
+        };
+        let id = self.store.insert(&incident)?;
+        self.recent.push(RecentRow {
+            at_unix,
+            id,
+            kind: kind::CODEC_CHANGE.to_owned(),
+            from_journal: false,
+        });
+        self.codec_rows.push(RecentCardRow {
+            card_id,
+            at_unix,
+            id,
+        });
+        eprintln!(
+            "btguard watch: codec {}: {} -> {}",
+            new.name,
+            old.codec.as_deref().unwrap_or("unknown"),
+            codec
+        );
+        Ok(())
+    }
+
     fn compare_streams(
         &mut self,
-        before: &HashMap<u64, Vec<f64>>,
+        before: &HashMap<u64, StreamLevels>,
         at_unix: i64,
         baseline: bool,
     ) -> Result<()> {
@@ -763,57 +1337,69 @@ impl<'a> Observer<'a> {
                 continue;
             }
 
-            let volumes = node.channel_volumes.clone();
+            let levels = StreamLevels {
+                volumes: node.channel_volumes.clone(),
+                map: node.channel_map.clone(),
+            };
             let sink = self.earbud_sink_for(node);
 
+            let card_id =
+                sink.and_then(|sink| self.nodes.get(&sink).and_then(|node| node.device_id));
+
             if !baseline
-                && let Some(sink) = sink
+                && let Some(card_id) = card_id
+                && !self
+                    .pending
+                    .iter()
+                    .any(|pending| pending.card_id == card_id)
+                && !self.recent_disconnect(card_id, at_unix)
                 && let Some(old) = before.get(&node.id)
-                && old.len() >= 2
-                && volumes.len() >= 2
-                && db_against_right(old) < CORRECTED_DB
-                && db_against_right(&volumes) > FLAT_DB
+                && let (Some(old_db), Some(new_db)) =
+                    (db_against_right(old), db_against_right(&levels))
+                && old_db < CORRECTED_DB
+                && new_db > old_db + BALANCE_DROP_DB
             {
-                let card = self
-                    .nodes
-                    .get(&sink)
-                    .and_then(|node| node.device_id)
-                    .and_then(|card_id| self.cards.get(&card_id));
+                let card = self.cards.get(&card_id);
                 let device = card.map(|card| card.name.clone());
                 let profile = card.and_then(|card| card.profile.clone());
                 let codec = card.and_then(|card| self.card_codec(card));
                 let journal = self.context(at_unix);
-                self.record(Incident {
-                    at_unix,
-                    kind: kind::BALANCE_DRIFT.to_owned(),
-                    device,
-                    profile_before: None,
-                    profile_after: profile,
-                    codec,
-                    detail: Some(format!(
-                        "stream {}: left {:.3}, right {:.3} ({:.1} dB against right); the balance correction was lost",
-                        node.name,
-                        volumes[0],
-                        volumes[1],
-                        db_against_right(&volumes)
-                    )),
-                    journal,
-                })?;
+                let lost = new_db > -1.0;
+                self.record_incident(
+                    Incident {
+                        at_unix,
+                        kind: kind::BALANCE_DRIFT.to_owned(),
+                        device,
+                        profile_before: None,
+                        profile_after: profile,
+                        codec,
+                        detail: Some(format!(
+                            "stream {}: left {:.3}, right {:.3} ({:.1} dB against right, was {:.1} dB); the balance correction {}",
+                            node.name,
+                            left_right(&levels).map(|(left, _)| left).unwrap_or(0.0),
+                            left_right(&levels).map(|(_, right)| right).unwrap_or(0.0),
+                            new_db,
+                            old_db,
+                            if lost { "was lost" } else { "weakened" }
+                        )),
+                        journal,
+                    },
+                    false,
+                )?;
                 eprintln!(
-                    "btguard watch: balance drift on {}: left {:.3}, right {:.3}",
-                    node.name, volumes[0], volumes[1]
+                    "btguard watch: balance drift on {}: {:.1} dB, was {:.1} dB",
+                    node.name, new_db, old_db
                 );
             }
 
-            next.insert(node.id, volumes);
+            next.insert(node.id, levels);
         }
 
         self.volumes = next;
         Ok(())
     }
 
-    /// The Bluetooth card that owns the sink a stream feeds, if it is the
-    /// earbuds. A stream names its target directly or is connected by a Link.
+    /// The Bluetooth sink a stream feeds, if it is the earbuds.
     fn earbud_sink_for(&self, node: &Node) -> Option<u64> {
         if let Some(target) = &node.target_object
             && let Some(sink) = self.nodes.values().find(|candidate| {
@@ -834,27 +1420,141 @@ impl<'a> Observer<'a> {
             })
     }
 
-    fn card_context(&self, device: Option<String>) -> CardContext {
-        let card = device
-            .as_deref()
-            .and_then(|name| self.cards.values().find(|card| card.name == name))
-            .or_else(|| {
-                let mut cards = self.cards.values();
-                let only = cards.next();
-                if cards.next().is_none() { only } else { None }
-            });
+    fn start_off_pending(&mut self, card: &Card, at_unix: i64) {
+        if let Some(pending) = self
+            .pending
+            .iter_mut()
+            .find(|pending| pending.card_id == card.id && (pending.at_unix - at_unix).abs() <= 1)
+        {
+            pending.incident.profile_after = Some("off".to_owned());
+            pending.incident.codec = self.last_codecs.get(&card.id).cloned();
+            pending.incident.detail =
+                Some("card is connected but silent on the off profile".to_owned());
+            return;
+        }
 
-        CardContext {
-            device: device.or_else(|| card.map(|card| card.name.clone())),
-            profile: card.and_then(|card| card.profile.clone()),
-            codec: card.and_then(|card| self.card_codec(card)),
+        let profile_before = self.last_profiles.get(&card.id).cloned();
+        let codec = self.last_codecs.get(&card.id).cloned();
+        let journal = self.context(at_unix);
+        self.pending.push(Pending {
+            card_id: card.id,
+            at_unix,
+            deadline: at_unix + PENDING_SECONDS,
+            incident: Incident {
+                at_unix,
+                kind: kind::PROFILE_CHANGE.to_owned(),
+                device: Some(card.name.clone()),
+                profile_before,
+                profile_after: Some("off".to_owned()),
+                codec,
+                detail: Some("card is connected but silent on the off profile".to_owned()),
+                journal,
+            },
+            from_journal: false,
+        });
+    }
+
+    fn start_transport_pending(&mut self, card_id: u64, trigger: &'static str, at_unix: i64) {
+        let Some(card) = self.cards.get(&card_id) else {
+            return;
+        };
+        let profile = self
+            .last_profiles
+            .get(&card_id)
+            .cloned()
+            .or_else(|| card.profile.clone());
+        let codec = self.last_codecs.get(&card_id).cloned();
+        let journal = self.context(at_unix);
+
+        self.pending.push(Pending {
+            card_id,
+            at_unix,
+            deadline: at_unix + PENDING_SECONDS,
+            incident: Incident {
+                at_unix,
+                kind: trigger.to_owned(),
+                device: Some(card.name.clone()),
+                profile_before: None,
+                profile_after: profile,
+                codec,
+                detail: None,
+                journal,
+            },
+            from_journal: true,
+        });
+    }
+
+    fn has_pending(&self, card_id: u64, at_unix: i64) -> bool {
+        self.pending
+            .iter()
+            .any(|pending| pending.card_id == card_id && (pending.at_unix - at_unix).abs() <= 1)
+    }
+
+    fn cancel_pending(&mut self, card_id: u64, at_unix: i64) {
+        self.pending.retain(|pending| {
+            !(pending.card_id == card_id && (pending.at_unix - at_unix).abs() <= CONTEXT_SECONDS)
+        });
+    }
+
+    fn recent_journal_row(&self, trigger: &str, at_unix: i64) -> Option<&RecentRow> {
+        self.recent
+            .iter()
+            .filter(|row| {
+                row.from_journal
+                    && row.kind == trigger
+                    && (row.at_unix - at_unix).abs() <= CONTEXT_SECONDS
+            })
+            .max_by_key(|row| row.at_unix)
+    }
+
+    fn recent_profile_row(&self, card_id: u64, at_unix: i64) -> Option<&RecentCardRow> {
+        self.profile_rows
+            .iter()
+            .filter(|row| {
+                row.card_id == card_id && (row.at_unix - at_unix).abs() <= CONTEXT_SECONDS
+            })
+            .max_by_key(|row| row.at_unix)
+    }
+
+    fn recent_codec_row(&self, card_id: u64, at_unix: i64) -> Option<&RecentCardRow> {
+        self.codec_rows
+            .iter()
+            .filter(|row| {
+                row.card_id == card_id && (row.at_unix - at_unix).abs() <= CONTEXT_SECONDS
+            })
+            .max_by_key(|row| row.at_unix)
+    }
+
+    fn recent_disconnect(&self, card_id: u64, at_unix: i64) -> bool {
+        self.disconnects
+            .iter()
+            .any(|(id, at)| *id == card_id && (at - at_unix).abs() <= CONTEXT_SECONDS)
+    }
+
+    fn card_for_line(&self, line: &JournalLine) -> Option<u64> {
+        let connected = |card: &&Card| card.connection.as_deref() != Some("disconnected");
+        if let Some(name) = line.device() {
+            return self
+                .cards
+                .values()
+                .find(|card| card.name == name)
+                .filter(connected)
+                .map(|card| card.id);
+        }
+
+        let mut cards = self.cards.values().filter(connected);
+        let first = cards.next();
+        if cards.next().is_none() {
+            first.map(|card| card.id)
+        } else {
+            None
         }
     }
 
     fn push_journal(&mut self, line: &JournalLine) {
         self.journal.push_back((line.at_unix, line.message.clone()));
         while let Some((second, _)) = self.journal.front() {
-            if *second < line.at_unix - CONTEXT_SECONDS {
+            if *second < line.at_unix - CONTEXT_BUFFER_SECONDS {
                 self.journal.pop_front();
             } else {
                 break;
@@ -869,7 +1569,7 @@ impl<'a> Observer<'a> {
         let lines: Vec<&str> = self
             .journal
             .iter()
-            .filter(|(second, _)| *second == at_unix)
+            .filter(|(second, _)| (second - at_unix).abs() <= CONTEXT_SECONDS)
             .map(|(_, line)| line.as_str())
             .collect();
         if lines.is_empty() {
@@ -880,32 +1580,62 @@ impl<'a> Observer<'a> {
     }
 
     fn append_to_recent(&self, at_unix: i64, message: &str, skip: Option<i64>) -> Result<()> {
-        for id in self.recent.get(&at_unix).cloned().unwrap_or_default() {
-            if Some(id) == skip {
+        for row in &self.recent {
+            if Some(row.id) == skip {
                 continue;
             }
-            self.store.append_journal(id, message)?;
+            if (row.at_unix - at_unix).abs() <= CONTEXT_SECONDS {
+                self.store.append_journal(row.id, message)?;
+            }
         }
         Ok(())
     }
 
-    fn record(&mut self, incident: Incident) -> Result<i64> {
+    fn record_incident(&mut self, incident: Incident, from_journal: bool) -> Result<i64> {
         let id = self.store.insert(&incident)?;
-        self.recent.entry(incident.at_unix).or_default().push(id);
+        self.recent.push(RecentRow {
+            at_unix: incident.at_unix,
+            id,
+            kind: incident.kind.clone(),
+            from_journal,
+        });
         Ok(id)
     }
 
     fn prune(&mut self, at_unix: i64) {
-        let cutoff = at_unix - CONTEXT_SECONDS;
-        self.recent.retain(|second, _| *second >= cutoff);
-        self.journal_rows.retain(|(second, _), _| *second >= cutoff);
+        let cutoff = at_unix - CONTEXT_BUFFER_SECONDS;
+        self.recent.retain(|row| row.at_unix >= cutoff);
+        self.profile_rows.retain(|row| row.at_unix >= cutoff);
+        self.codec_rows.retain(|row| row.at_unix >= cutoff);
+        self.disconnects.retain(|(_, at)| *at >= cutoff);
     }
 }
 
-fn db_against_right(volumes: &[f64]) -> f64 {
-    let left = volumes[0].max(1e-9);
-    let right = volumes[1].max(1e-9);
-    20.0 * (left / right).log10()
+fn left_right(levels: &StreamLevels) -> Option<(f64, f64)> {
+    let left_index = levels
+        .map
+        .iter()
+        .position(|channel| channel == "FL")
+        .unwrap_or(0);
+    let right_index = levels
+        .map
+        .iter()
+        .position(|channel| channel == "FR")
+        .unwrap_or(1);
+    if left_index == right_index
+        || levels.volumes.len() <= left_index
+        || levels.volumes.len() <= right_index
+    {
+        return None;
+    }
+    Some((levels.volumes[left_index], levels.volumes[right_index]))
+}
+
+fn db_against_right(levels: &StreamLevels) -> Option<f64> {
+    let (left, right) = left_right(levels)?;
+    let left = left.max(1e-9);
+    let right = right.max(1e-9);
+    Some(20.0 * (left / right).log10())
 }
 
 fn local_time(unix: i64) -> String {
@@ -924,6 +1654,7 @@ mod tests {
 
     // Real captures from this machine. See tests/fixtures/README.md.
     const WITH_EARBUDS: &str = include_str!("../tests/fixtures/pw-dump-bluez.json");
+    const WITHOUT_EARBUDS: &str = include_str!("../tests/fixtures/pw-dump-no-bluez.json");
     const WITH_STREAMS: &str = include_str!("../tests/fixtures/pw-dump-streams.json");
     const JOURNAL: &str = include_str!("../tests/fixtures/journal-bluetooth.jsonl");
     const LIVE: &str = include_str!("../tests/fixtures/pw-monitor-live.jsonl");
@@ -958,20 +1689,27 @@ mod tests {
         store.since(0, 100).expect("read incidents")
     }
 
-    fn only<'a>(rows: &'a [Incident], kind: &str) -> &'a Incident {
+    fn only(rows: &[Incident], kind: &str) -> Incident {
         let matching: Vec<&Incident> = rows.iter().filter(|row| row.kind == kind).collect();
         assert_eq!(matching.len(), 1, "expected one {kind} row in {rows:#?}");
-        matching[0]
+        matching[0].clone()
     }
 
     fn count(rows: &[Incident], kind: &str) -> usize {
         rows.iter().filter(|row| row.kind == kind).count()
     }
 
-    fn relevant_journal() -> Vec<JournalLine> {
+    fn all_journal() -> Vec<JournalLine> {
         JOURNAL
             .lines()
-            .filter_map(|raw| JournalLine::parse(raw).expect("parse a real journal line"))
+            .map(|raw| JournalLine::parse(raw).expect("parse a real journal line"))
+            .collect()
+    }
+
+    fn relevant_journal() -> Vec<JournalLine> {
+        all_journal()
+            .into_iter()
+            .filter(|line| line.relevant)
             .collect()
     }
 
@@ -979,13 +1717,28 @@ mod tests {
         relevant_journal()
             .into_iter()
             .find(|line| line.message.contains(needle))
-            .unwrap_or_else(|| panic!("no journal line with {needle:?}"))
+            .unwrap_or_else(|| panic!("no relevant journal line with {needle:?}"))
+    }
+
+    fn journal_at(needle: &str, at_unix: i64) -> JournalLine {
+        let mut line = journal_line(needle);
+        line.at_unix = at_unix;
+        line.cursor = Some(format!("cursor-{at_unix}"));
+        line
     }
 
     fn baseline<'a>(store: &'a Store, raw: &str, at: i64) -> Observer<'a> {
         let mut observer = Observer::new(store);
-        observer.on_monitor(&dump(raw), at).expect("the baseline");
         observer
+            .on_monitor(&dump(raw), at, true)
+            .expect("the baseline");
+        observer
+    }
+
+    fn remove(observer: &mut Observer<'_>, id: u64, at: i64) {
+        observer
+            .on_monitor(&[json!({"id": id, "info": null})], at, false)
+            .expect("apply the removal");
     }
 
     fn read_all(raw: &[u8]) -> Vec<Vec<Value>> {
@@ -1057,26 +1810,27 @@ mod tests {
 
     #[test]
     fn reads_real_journal_lines_and_their_kinds() {
-        let lines = relevant_journal();
-        assert_eq!(lines.len(), 8, "the USB line is not Bluetooth");
+        let all = all_journal();
+        assert_eq!(all.len(), 9);
+        assert_eq!(all.iter().filter(|line| line.relevant).count(), 8);
 
-        let failure = lines
+        let failure = all
             .iter()
             .find(|line| {
-                line.message
-                    .contains("Failure in Bluetooth audio transport")
-                    && line.at_unix == 1_794_830_708
+                line.at_unix == 1_794_830_708
+                    && line
+                        .message
+                        .contains("Failure in Bluetooth audio transport")
             })
-            .expect("a real transport failure");
+            .expect("the real transport failure");
         assert_eq!(failure.identifier, "wireplumber");
-        assert_eq!(failure.at_unix, 1_794_830_708);
         assert_eq!(failure.incident_kind(), Some(kind::TRANSPORT_FAILURE));
         assert_eq!(
             failure.device().as_deref(),
             Some("bluez_card.1C_0A_E0_A3_E2_D0")
         );
 
-        let sco = lines
+        let sco = all
             .iter()
             .find(|line| line.message.contains("SCO packet"))
             .expect("a real SCO line");
@@ -1084,7 +1838,7 @@ mod tests {
         assert_eq!(sco.incident_kind(), Some(kind::SCO_ORPHAN));
         assert_eq!(sco.device(), None);
 
-        let ready = lines
+        let ready = all
             .iter()
             .find(|line| line.message.contains("fd(29) ready"))
             .expect("a real bluetoothd line");
@@ -1095,11 +1849,11 @@ mod tests {
             Some("bluez_card.1C_0A_E0_A3_E2_D0")
         );
 
-        let usb = JOURNAL
-            .lines()
-            .find(|raw| raw.contains("usb 3-1"))
+        let usb = all
+            .iter()
+            .find(|line| line.message.contains("usb 3-1"))
             .expect("the kernel USB line");
-        assert_eq!(JournalLine::parse(usb).unwrap(), None);
+        assert!(!usb.relevant);
     }
 
     #[test]
@@ -1118,7 +1872,8 @@ mod tests {
             "83,67,79,32,112,97,99,107,101,116,32,102,111,114,32,117,110,107,110,111,119,110,32,",
             "99,111,110,110,101,99,116,105,111,110,32,104,97,110,100,108,101,32,50]}"
         );
-        let line = JournalLine::parse(raw).unwrap().expect("a relevant line");
+        let line = JournalLine::parse(raw).expect("a relevant line");
+        assert!(line.relevant);
         assert_eq!(
             line.message,
             "Bluetooth: hci0: SCO packet for unknown connection handle 2"
@@ -1127,10 +1882,46 @@ mod tests {
     }
 
     #[test]
+    fn a_comm_fallback_keeps_a_wireplumber_line() {
+        let raw = concat!(
+            "{\"__REALTIME_TIMESTAMP\":\"1794830708589459\",",
+            "\"_COMM\":\"wireplumber\",",
+            "\"MESSAGE\":\"spa.bluez5: Failure in Bluetooth audio transport /org/bluez/hci0/dev_1C_0A_E0_A3_E2_D0/sep1/fd0\"}"
+        );
+        let line = JournalLine::parse(raw).expect("parse");
+        assert_eq!(line.identifier, "wireplumber");
+        assert!(line.relevant);
+        assert_eq!(line.incident_kind(), Some(kind::TRANSPORT_FAILURE));
+    }
+
+    #[test]
+    fn a_numeric_realtime_timestamp_is_accepted() {
+        let raw = concat!(
+            "{\"__REALTIME_TIMESTAMP\":1794830708589459,",
+            "\"SYSLOG_IDENTIFIER\":\"kernel\",",
+            "\"MESSAGE\":\"Bluetooth: hci0: SCO packet for unknown connection handle 2\"}"
+        );
+        let line = JournalLine::parse(raw).expect("parse");
+        assert_eq!(line.at_unix, 1_794_830_708);
+    }
+
+    #[test]
+    fn a_cursor_is_read_from_the_line() {
+        let raw = concat!(
+            "{\"__REALTIME_TIMESTAMP\":\"1794830708589459\",",
+            "\"SYSLOG_IDENTIFIER\":\"kernel\",",
+            "\"__CURSOR\":\"s=abc;i=42\",",
+            "\"MESSAGE\":\"Bluetooth: hci0: SCO packet for unknown connection handle 2\"}"
+        );
+        let line = JournalLine::parse(raw).expect("parse");
+        assert_eq!(line.cursor.as_deref(), Some("s=abc;i=42"));
+    }
+
+    #[test]
     fn the_first_dump_is_a_baseline_with_no_incidents() {
         let (_dir, store) = store();
         let mut observer = Observer::new(&store);
-        observer.on_monitor(&dump(WITH_STREAMS), T).unwrap();
+        observer.on_monitor(&dump(WITH_STREAMS), T, true).unwrap();
 
         assert!(recorded(&store).is_empty());
         assert_eq!(observer.cards.len(), 1);
@@ -1143,174 +1934,43 @@ mod tests {
             observer.default_sink.as_deref(),
             Some("bluez_output.1C_0A_E0_A3_E2_D0.1")
         );
+
+        let levels = observer.volumes.get(&74).expect("Meiro");
+        assert_eq!(levels.volumes, vec![0.199_520, 1.0]);
+        assert_eq!(levels.map, ["FL", "FR"]);
         assert_eq!(
-            observer.volumes.get(&74).map(Vec::as_slice),
-            Some(&[0.199520, 1.0][..])
-        );
-        assert_eq!(
-            observer.volumes.get(&95).map(Vec::as_slice),
-            Some(&[0.199520, 1.0][..])
-        );
-        assert!(
-            !observer.volumes.contains_key(&88),
-            "an input stream has no playback balance"
+            db_against_right(levels),
+            Some(20.0 * (0.199_520_f64).log10())
         );
 
-        let meiro = observer.nodes.get(&74).expect("Meiro, mapped by a Link");
+        let meiro = observer.nodes.get(&74).expect("Meiro");
         assert_eq!(observer.earbud_sink_for(meiro), Some(94));
-        let sober = observer
-            .nodes
-            .get(&95)
-            .expect("Sober, mapped by target.object");
+        let sober = observer.nodes.get(&95).expect("Sober");
         assert_eq!(observer.earbud_sink_for(sober), Some(94));
     }
 
     #[test]
-    fn a_profile_change_is_one_row() {
-        let (_dir, store) = store();
-        let mut observer = baseline(&store, WITH_EARBUDS, T);
-        let objects = dump(WITH_EARBUDS);
-
-        let mut card = object(&objects, 98);
-        set(
-            &mut card,
-            "/info/params/Profile/0/name",
-            json!("headset-head-unit"),
-        );
-        set(
-            &mut card,
-            "/info/params/Profile/0/description",
-            json!("Headset Head Unit (HFP)"),
-        );
-
-        observer.on_monitor(&[card], T + 5).unwrap();
-
-        let rows = recorded(&store);
-        let row = only(&rows, kind::PROFILE_CHANGE);
-        assert_eq!(row.at_unix, T + 5);
-        assert_eq!(row.device.as_deref(), Some("bluez_card.1C_0A_E0_A3_E2_D0"));
-        assert_eq!(row.profile_before.as_deref(), Some("a2dp-sink-sbc"));
-        assert_eq!(row.profile_after.as_deref(), Some("headset-head-unit"));
-        assert_eq!(row.codec.as_deref(), Some("sbc"));
-        assert_eq!(count(&rows, kind::CODEC_CHANGE), 0);
-    }
-
-    #[test]
-    fn a_profile_change_and_its_codec_change_are_one_row() {
-        let (_dir, store) = store();
-        let mut observer = baseline(&store, WITH_EARBUDS, T);
-        let objects = dump(WITH_EARBUDS);
-
-        let mut card = object(&objects, 98);
-        set(
-            &mut card,
-            "/info/params/Profile/0/name",
-            json!("headset-head-unit"),
-        );
-        let mut sink = object(&objects, 94);
-        set(&mut sink, "/info/props/api.bluez5.codec", json!("cvsd"));
-
-        observer.on_monitor(&[card, sink], T + 5).unwrap();
-
-        let rows = recorded(&store);
-        let row = only(&rows, kind::PROFILE_CHANGE);
-        assert_eq!(row.profile_after.as_deref(), Some("headset-head-unit"));
-        assert_eq!(row.codec.as_deref(), Some("cvsd"));
-        assert_eq!(count(&rows, kind::CODEC_CHANGE), 0);
-    }
-
-    #[test]
-    fn a_codec_change_is_one_row() {
-        let (_dir, store) = store();
-        let mut observer = baseline(&store, WITH_EARBUDS, T);
-        let objects = dump(WITH_EARBUDS);
-
-        let mut sink = object(&objects, 94);
-        set(&mut sink, "/info/props/api.bluez5.codec", json!("ldac"));
-
-        observer.on_monitor(&[sink], T + 5).unwrap();
-
-        let rows = recorded(&store);
-        let row = only(&rows, kind::CODEC_CHANGE);
-        assert_eq!(row.at_unix, T + 5);
-        assert_eq!(row.device.as_deref(), Some("bluez_card.1C_0A_E0_A3_E2_D0"));
-        assert_eq!(row.profile_after.as_deref(), Some("a2dp-sink-sbc"));
-        assert_eq!(row.codec.as_deref(), Some("ldac"));
-        assert_eq!(row.detail.as_deref(), Some("codec sbc -> ldac"));
-    }
-
-    #[test]
-    fn a_sink_that_disappears_is_not_a_codec_change() {
+    fn a_full_snapshot_after_a_restart_reconciles_the_graph() {
         let (_dir, store) = store();
         let mut observer = baseline(&store, WITH_EARBUDS, T);
 
+        // A PipeWire restart delivers a full snapshot with no Bluetooth card.
         observer
-            .on_monitor(&[json!({"id": 94, "info": null})], T + 5)
+            .on_monitor(&dump(WITHOUT_EARBUDS), T + 5, true)
             .unwrap();
+        assert!(observer.cards.is_empty());
+        assert!(recorded(&store).is_empty());
 
-        assert_eq!(count(&recorded(&store), kind::CODEC_CHANGE), 0);
-        assert_eq!(count(&recorded(&store), kind::PROFILE_CHANGE), 0);
+        // The next full snapshot has the card again.
+        observer
+            .on_monitor(&dump(WITH_EARBUDS), T + 10, true)
+            .unwrap();
+        assert_eq!(observer.cards.len(), 1);
+        assert!(recorded(&store).is_empty());
     }
 
     #[test]
-    fn a_teardown_reports_the_last_working_profile() {
-        let (_dir, store) = store();
-        let mut observer = baseline(&store, WITH_EARBUDS, T);
-        let objects = dump(WITH_EARBUDS);
-
-        let mut card = object(&objects, 98);
-        set(&mut card, "/info/params/Profile/0/name", json!("off"));
-        observer
-            .on_monitor(&[json!({"id": 94, "info": null}), card], T + 5)
-            .unwrap();
-        assert_eq!(
-            recorded(&store).len(),
-            0,
-            "the sink removal and the off profile are teardown, not incidents"
-        );
-
-        observer
-            .on_monitor(&[json!({"id": 98, "info": null})], T + 6)
-            .unwrap();
-
-        let rows = recorded(&store);
-        let row = only(&rows, kind::DISCONNECT);
-        assert_eq!(row.profile_before.as_deref(), Some("a2dp-sink-sbc"));
-        assert_eq!(row.codec.as_deref(), Some("sbc"));
-        assert_eq!(count(&rows, kind::PROFILE_CHANGE), 0);
-        assert_eq!(count(&rows, kind::CODEC_CHANGE), 0);
-    }
-
-    #[test]
-    fn a_reconnect_does_not_invent_rows() {
-        let (_dir, store) = store();
-        let mut observer = baseline(&store, WITH_EARBUDS, T);
-        let objects = dump(WITH_EARBUDS);
-
-        // The real sequence: sink removed, card profile off, card removed.
-        let mut card_off = object(&objects, 98);
-        set(&mut card_off, "/info/params/Profile/0/name", json!("off"));
-        observer
-            .on_monitor(&[json!({"id": 94, "info": null}), card_off.clone()], T + 5)
-            .unwrap();
-        observer
-            .on_monitor(&[json!({"id": 98, "info": null})], T + 6)
-            .unwrap();
-
-        // Then the card comes back off, and settles on A2DP with a new sink.
-        observer.on_monitor(&[card_off], T + 7).unwrap();
-        observer
-            .on_monitor(&[object(&objects, 98), object(&objects, 94)], T + 8)
-            .unwrap();
-
-        let rows = recorded(&store);
-        assert_eq!(count(&rows, kind::DISCONNECT), 1);
-        assert_eq!(count(&rows, kind::PROFILE_CHANGE), 0);
-        assert_eq!(count(&rows, kind::CODEC_CHANGE), 0);
-    }
-
-    #[test]
-    fn a_removed_card_is_one_disconnect_row() {
+    fn a_normal_disconnect_records_nothing() {
         let (_dir, store) = store();
         let mut observer = baseline(&store, WITH_EARBUDS, T);
 
@@ -1321,26 +1981,41 @@ mod tests {
                     json!({"id": 94, "info": null}),
                 ],
                 T + 5,
+                false,
             )
             .unwrap();
 
-        let rows = recorded(&store);
-        let row = only(&rows, kind::DISCONNECT);
-        assert_eq!(row.at_unix, T + 5);
-        assert_eq!(row.device.as_deref(), Some("bluez_card.1C_0A_E0_A3_E2_D0"));
-        assert_eq!(row.profile_before.as_deref(), Some("a2dp-sink-sbc"));
-        assert_eq!(row.profile_after, None);
-        assert_eq!(row.codec.as_deref(), Some("sbc"));
+        assert!(recorded(&store).is_empty());
         assert!(observer.cards.is_empty());
-
-        observer
-            .on_monitor(&[json!({"id": 98, "info": null})], T + 6)
-            .unwrap();
-        assert_eq!(count(&recorded(&store), kind::DISCONNECT), 1);
     }
 
     #[test]
-    fn a_connection_change_then_a_removal_is_one_disconnect_row() {
+    fn a_card_without_the_connection_prop_is_handled() {
+        let (_dir, store) = store();
+        let mut objects = dump(WITH_EARBUDS);
+        let card = objects
+            .iter_mut()
+            .find(|object| object["id"] == json!(98))
+            .expect("the card");
+        card["info"]["props"]
+            .as_object_mut()
+            .expect("props")
+            .remove("api.bluez5.connection");
+
+        let mut observer = Observer::new(&store);
+        observer.on_monitor(&objects, T, true).unwrap();
+        assert_eq!(observer.cards.len(), 1);
+
+        observer
+            .on_monitor(&[json!({"id": 98, "info": null})], T + 5, false)
+            .unwrap();
+
+        assert!(observer.cards.is_empty());
+        assert!(recorded(&store).is_empty());
+    }
+
+    #[test]
+    fn a_connection_change_then_a_removal_records_nothing() {
         let (_dir, store) = store();
         let mut observer = baseline(&store, WITH_EARBUDS, T);
         let objects = dump(WITH_EARBUDS);
@@ -1351,28 +2026,95 @@ mod tests {
             "/info/props/api.bluez5.connection",
             json!("disconnected"),
         );
-        observer.on_monitor(&[card], T + 5).unwrap();
-        assert_eq!(count(&recorded(&store), kind::DISCONNECT), 1);
+        observer.on_monitor(&[card], T + 5, false).unwrap();
+        remove(&mut observer, 98, T + 6);
 
-        observer
-            .on_monitor(&[json!({"id": 98, "info": null})], T + 6)
-            .unwrap();
-        assert_eq!(count(&recorded(&store), kind::DISCONNECT), 1);
+        assert!(recorded(&store).is_empty());
     }
 
     #[test]
-    fn a_disconnect_carries_the_journal_from_its_second() {
+    fn replays_the_real_disconnect_and_reconnect() {
+        let (_dir, store) = store();
+        let mut observer = Observer::new(&store);
+
+        for (index, line) in LIVE.lines().enumerate() {
+            let array: Vec<Value> = serde_json::from_str(line).expect("a real monitor array");
+            observer
+                .on_monitor(&array, T + index as i64, index == 0)
+                .expect("apply a real monitor array");
+        }
+        observer.flush_pending(T + 200).unwrap();
+
+        assert!(
+            recorded(&store).is_empty(),
+            "a normal disconnect and reconnect must make no rows"
+        );
+    }
+
+    #[test]
+    fn a_teardown_transport_line_records_nothing() {
         let (_dir, store) = store();
         let mut observer = baseline(&store, WITH_EARBUDS, T);
-        let failure = journal_line("Failure in Bluetooth audio transport");
+        let objects = dump(WITH_EARBUDS);
 
-        observer.on_journal(failure.clone()).unwrap();
+        let mut card = object(&objects, 98);
+        set(&mut card, "/info/params/Profile/0/name", json!("off"));
+        observer.on_monitor(&[card], T + 5, false).unwrap();
         observer
-            .on_monitor(&[json!({"id": 98, "info": null})], failure.at_unix)
+            .on_journal(journal_at("Failure in Bluetooth audio transport", T + 5))
             .unwrap();
+        remove(&mut observer, 98, T + 6);
+        observer.flush_pending(T + 8).unwrap();
 
+        assert!(recorded(&store).is_empty());
+    }
+
+    #[test]
+    fn a_transport_line_after_the_card_is_gone_records_nothing() {
+        let (_dir, store) = store();
+        let mut observer = baseline(&store, WITH_EARBUDS, T);
+        remove(&mut observer, 98, T + 5);
+
+        observer
+            .on_journal(journal_at("Failure in Bluetooth audio transport", T + 6))
+            .unwrap();
+        observer.flush_pending(T + 8).unwrap();
+
+        assert!(recorded(&store).is_empty());
+    }
+
+    #[test]
+    fn a_transport_line_before_a_normal_disconnect_records_nothing() {
+        let (_dir, store) = store();
+        let mut observer = baseline(&store, WITH_EARBUDS, T);
+
+        observer
+            .on_journal(journal_at("Failure in Bluetooth audio transport", T + 5))
+            .unwrap();
+        remove(&mut observer, 98, T + 6);
+        observer.flush_pending(T + 8).unwrap();
+
+        assert!(recorded(&store).is_empty());
+    }
+
+    #[test]
+    fn a_transport_failure_while_connected_is_one_row() {
+        let (_dir, store) = store();
+        let mut observer = baseline(&store, WITH_EARBUDS, T);
+
+        observer
+            .on_journal(journal_at("Failure in Bluetooth audio transport", T + 5))
+            .unwrap();
+        observer.flush_pending(T + 6).unwrap();
+        assert!(recorded(&store).is_empty(), "the window is still open");
+
+        observer.flush_pending(T + 7).unwrap();
         let rows = recorded(&store);
-        let row = only(&rows, kind::DISCONNECT);
+        let row = only(&rows, kind::TRANSPORT_FAILURE);
+        assert_eq!(row.at_unix, T + 5);
+        assert_eq!(row.device.as_deref(), Some("bluez_card.1C_0A_E0_A3_E2_D0"));
+        assert_eq!(row.profile_after.as_deref(), Some("a2dp-sink-sbc"));
+        assert_eq!(row.codec.as_deref(), Some("sbc"));
         assert!(
             row.journal
                 .as_deref()
@@ -1382,44 +2124,73 @@ mod tests {
     }
 
     #[test]
-    fn a_transport_failure_and_its_same_second_context_are_one_row() {
+    fn a_transport_burst_across_a_second_is_one_row() {
         let (_dir, store) = store();
         let mut observer = baseline(&store, WITH_EARBUDS, T);
 
-        let terminated = journal_line("terminated unexpectedly");
-        let failure = relevant_journal()
-            .into_iter()
-            .find(|line| {
-                line.message
-                    .contains("Failure in Bluetooth audio transport")
-                    && line.at_unix == terminated.at_unix
-            })
-            .expect("the real pair is in one second");
-
-        observer.on_journal(terminated).unwrap();
-        observer.on_journal(failure.clone()).unwrap();
-        observer.on_journal(failure).unwrap();
+        observer
+            .on_journal(journal_at("Failure in Bluetooth audio transport", T + 5))
+            .unwrap();
+        observer
+            .on_journal(journal_at("Failure in Bluetooth audio transport", T + 6))
+            .unwrap();
+        observer.flush_pending(T + 8).unwrap();
 
         let rows = recorded(&store);
         let row = only(&rows, kind::TRANSPORT_FAILURE);
-        let journal = row.journal.as_deref().expect("the journal lines");
-        assert!(journal.contains("terminated unexpectedly"), "{journal}");
         assert_eq!(
-            journal
+            row.journal
+                .as_deref()
+                .unwrap()
                 .matches("Failure in Bluetooth audio transport")
                 .count(),
             2
         );
-        assert_eq!(row.device.as_deref(), Some("bluez_card.1C_0A_E0_A3_E2_D0"));
-        assert_eq!(row.profile_after.as_deref(), Some("a2dp-sink-sbc"));
     }
 
     #[test]
-    fn a_journal_line_backfills_a_profile_change_from_the_same_second() {
+    fn a_sco_line_on_teardown_records_nothing() {
         let (_dir, store) = store();
         let mut observer = baseline(&store, WITH_EARBUDS, T);
         let objects = dump(WITH_EARBUDS);
-        let terminated = journal_line("terminated unexpectedly");
+
+        let mut card = object(&objects, 98);
+        set(&mut card, "/info/params/Profile/0/name", json!("off"));
+        observer.on_monitor(&[card], T + 5, false).unwrap();
+        observer
+            .on_journal(journal_at(
+                "SCO packet for unknown connection handle",
+                T + 5,
+            ))
+            .unwrap();
+        remove(&mut observer, 98, T + 6);
+        observer.flush_pending(T + 8).unwrap();
+
+        assert!(recorded(&store).is_empty());
+    }
+
+    #[test]
+    fn a_sco_line_while_connected_is_one_row() {
+        let (_dir, store) = store();
+        let mut observer = baseline(&store, WITH_EARBUDS, T);
+
+        observer
+            .on_journal(journal_at(
+                "SCO packet for unknown connection handle",
+                T + 5,
+            ))
+            .unwrap();
+        observer.flush_pending(T + 7).unwrap();
+
+        let row = only(&recorded(&store), kind::SCO_ORPHAN);
+        assert_eq!(row.device.as_deref(), Some("bluez_card.1C_0A_E0_A3_E2_D0"));
+    }
+
+    #[test]
+    fn journal_context_within_one_second_is_attached() {
+        let (_dir, store) = store();
+        let mut observer = baseline(&store, WITH_EARBUDS, T);
+        let objects = dump(WITH_EARBUDS);
 
         let mut card = object(&objects, 98);
         set(
@@ -1427,33 +2198,25 @@ mod tests {
             "/info/params/Profile/0/name",
             json!("headset-head-unit"),
         );
-        observer.on_monitor(&[card], terminated.at_unix).unwrap();
-        observer.on_journal(terminated).unwrap();
+        observer.on_monitor(&[card], T + 5, false).unwrap();
+        observer
+            .on_journal(journal_at("terminated unexpectedly", T + 6))
+            .unwrap();
 
-        let rows = recorded(&store);
-        let change = only(&rows, kind::PROFILE_CHANGE);
+        let row = only(&recorded(&store), kind::PROFILE_CHANGE);
         assert!(
-            change
-                .journal
+            row.journal
                 .as_deref()
                 .unwrap()
                 .contains("terminated unexpectedly")
         );
-        assert_eq!(
-            count(&rows, kind::TRANSPORT_FAILURE),
-            0,
-            "the terminated line is context, not a separate trigger"
-        );
     }
 
     #[test]
-    fn a_journal_line_from_another_second_is_not_attached() {
+    fn journal_context_two_seconds_later_is_not_attached() {
         let (_dir, store) = store();
         let mut observer = baseline(&store, WITH_EARBUDS, T);
         let objects = dump(WITH_EARBUDS);
-        let ready = journal_line("fd(29) ready");
-
-        observer.on_journal(ready.clone()).unwrap();
 
         let mut card = object(&objects, 98);
         set(
@@ -1461,18 +2224,241 @@ mod tests {
             "/info/params/Profile/0/name",
             json!("headset-head-unit"),
         );
-        observer.on_monitor(&[card], ready.at_unix + 1).unwrap();
+        observer.on_monitor(&[card], T + 5, false).unwrap();
+        observer
+            .on_journal(journal_at("terminated unexpectedly", T + 7))
+            .unwrap();
+
+        let row = only(&recorded(&store), kind::PROFILE_CHANGE);
+        assert_eq!(row.journal, None);
+    }
+
+    #[test]
+    fn a_transport_line_after_a_profile_change_is_folded() {
+        let (_dir, store) = store();
+        let mut observer = baseline(&store, WITH_EARBUDS, T);
+        let objects = dump(WITH_EARBUDS);
+
+        let mut card = object(&objects, 98);
+        set(
+            &mut card,
+            "/info/params/Profile/0/name",
+            json!("headset-head-unit"),
+        );
+        observer.on_monitor(&[card], T + 5, false).unwrap();
+        observer
+            .on_journal(journal_at("Failure in Bluetooth audio transport", T + 6))
+            .unwrap();
+        observer.flush_pending(T + 8).unwrap();
 
         let rows = recorded(&store);
-        let change = only(&rows, kind::PROFILE_CHANGE);
-        assert_eq!(change.journal, None);
+        let row = only(&rows, kind::PROFILE_CHANGE);
+        assert_eq!(count(&rows, kind::TRANSPORT_FAILURE), 0);
+        assert!(
+            row.journal
+                .as_deref()
+                .unwrap()
+                .contains("Failure in Bluetooth audio transport")
+        );
+    }
+
+    #[test]
+    fn a_transport_line_before_a_profile_change_is_folded() {
+        let (_dir, store) = store();
+        let mut observer = baseline(&store, WITH_EARBUDS, T);
+        let objects = dump(WITH_EARBUDS);
+
+        observer
+            .on_journal(journal_at("Failure in Bluetooth audio transport", T + 5))
+            .unwrap();
+
+        let mut card = object(&objects, 98);
+        set(
+            &mut card,
+            "/info/params/Profile/0/name",
+            json!("headset-head-unit"),
+        );
+        observer.on_monitor(&[card], T + 6, false).unwrap();
+        observer.flush_pending(T + 8).unwrap();
+
+        let rows = recorded(&store);
+        let row = only(&rows, kind::PROFILE_CHANGE);
+        assert_eq!(count(&rows, kind::TRANSPORT_FAILURE), 0);
+        assert!(
+            row.journal
+                .as_deref()
+                .unwrap()
+                .contains("Failure in Bluetooth audio transport")
+        );
+    }
+
+    #[test]
+    fn one_aac_selection_in_two_arrays_is_one_row() {
+        let (_dir, store) = store();
+        let mut observer = baseline(&store, WITH_EARBUDS, T);
+        let objects = dump(WITH_EARBUDS);
+
+        let mut card = object(&objects, 98);
+        set(
+            &mut card,
+            "/info/params/Profile/0/name",
+            json!("a2dp-sink-aac"),
+        );
+        observer.on_monitor(&[card], T + 5, false).unwrap();
+
+        let mut sink = object(&objects, 94);
+        set(&mut sink, "/info/props/api.bluez5.codec", json!("aac"));
+        observer.on_monitor(&[sink], T + 6, false).unwrap();
+
+        let rows = recorded(&store);
+        let row = only(&rows, kind::PROFILE_CHANGE);
+        assert_eq!(rows.len(), 1, "rows: {rows:#?}");
+        assert_eq!(row.profile_before.as_deref(), Some("a2dp-sink-sbc"));
+        assert_eq!(row.profile_after.as_deref(), Some("a2dp-sink-aac"));
+        assert_eq!(row.codec.as_deref(), Some("aac"));
+    }
+
+    #[test]
+    fn an_aac_codec_row_folds_into_the_profile_row() {
+        let (_dir, store) = store();
+        let mut observer = baseline(&store, WITH_EARBUDS, T);
+        let objects = dump(WITH_EARBUDS);
+
+        let mut sink = object(&objects, 94);
+        set(&mut sink, "/info/props/api.bluez5.codec", json!("aac"));
+        observer.on_monitor(&[sink], T + 5, false).unwrap();
+
+        let mut card = object(&objects, 98);
+        set(
+            &mut card,
+            "/info/params/Profile/0/name",
+            json!("a2dp-sink-aac"),
+        );
+        observer.on_monitor(&[card], T + 6, false).unwrap();
+
+        let rows = recorded(&store);
+        let row = only(&rows, kind::PROFILE_CHANGE);
+        assert_eq!(rows.len(), 1, "rows: {rows:#?}");
+        assert_eq!(row.profile_after.as_deref(), Some("a2dp-sink-aac"));
+        assert_eq!(row.codec.as_deref(), Some("aac"));
+    }
+
+    #[test]
+    fn a_standalone_codec_change_is_one_row() {
+        let (_dir, store) = store();
+        let mut observer = baseline(&store, WITH_EARBUDS, T);
+        let objects = dump(WITH_EARBUDS);
+
+        let mut sink = object(&objects, 94);
+        set(&mut sink, "/info/props/api.bluez5.codec", json!("aac"));
+        observer.on_monitor(&[sink], T + 5, false).unwrap();
+
+        let rows = recorded(&store);
+        let row = only(&rows, kind::CODEC_CHANGE);
+        assert_eq!(row.codec.as_deref(), Some("aac"));
+        assert_eq!(row.profile_after.as_deref(), Some("a2dp-sink-sbc"));
+    }
+
+    #[test]
+    fn a_profile_and_codec_in_one_array_is_one_row() {
+        let (_dir, store) = store();
+        let mut observer = baseline(&store, WITH_EARBUDS, T);
+        let objects = dump(WITH_EARBUDS);
+
+        let mut card = object(&objects, 98);
+        set(
+            &mut card,
+            "/info/params/Profile/0/name",
+            json!("a2dp-sink-aac"),
+        );
+        let mut sink = object(&objects, 94);
+        set(&mut sink, "/info/props/api.bluez5.codec", json!("aac"));
+        observer.on_monitor(&[card, sink], T + 5, false).unwrap();
+
+        let rows = recorded(&store);
+        let row = only(&rows, kind::PROFILE_CHANGE);
+        assert_eq!(count(&rows, kind::CODEC_CHANGE), 0);
+        assert_eq!(row.codec.as_deref(), Some("aac"));
+    }
+
+    #[test]
+    fn off_while_connected_is_a_row_after_the_window() {
+        let (_dir, store) = store();
+        let mut observer = baseline(&store, WITH_EARBUDS, T);
+        let objects = dump(WITH_EARBUDS);
+
+        let mut card = object(&objects, 98);
+        set(&mut card, "/info/params/Profile/0/name", json!("off"));
+        observer.on_monitor(&[card], T + 5, false).unwrap();
+        assert!(recorded(&store).is_empty(), "the teardown window is open");
+
+        observer.flush_pending(T + 7).unwrap();
+        let row = only(&recorded(&store), kind::PROFILE_CHANGE);
+        assert_eq!(row.profile_before.as_deref(), Some("a2dp-sink-sbc"));
+        assert_eq!(row.profile_after.as_deref(), Some("off"));
+    }
+
+    #[test]
+    fn off_then_disconnect_is_not_a_row() {
+        let (_dir, store) = store();
+        let mut observer = baseline(&store, WITH_EARBUDS, T);
+        let objects = dump(WITH_EARBUDS);
+
+        let mut card = object(&objects, 98);
+        set(&mut card, "/info/params/Profile/0/name", json!("off"));
+        observer.on_monitor(&[card], T + 5, false).unwrap();
+        remove(&mut observer, 98, T + 6);
+        observer.flush_pending(T + 8).unwrap();
+
+        assert!(recorded(&store).is_empty());
+    }
+
+    #[test]
+    fn off_then_back_on_is_not_a_row() {
+        let (_dir, store) = store();
+        let mut observer = baseline(&store, WITH_EARBUDS, T);
+        let objects = dump(WITH_EARBUDS);
+
+        let mut card = object(&objects, 98);
+        set(&mut card, "/info/params/Profile/0/name", json!("off"));
+        observer.on_monitor(&[card], T + 5, false).unwrap();
+        observer
+            .on_monitor(&[object(&objects, 98)], T + 6, false)
+            .unwrap();
+        observer.flush_pending(T + 8).unwrap();
+
+        assert!(recorded(&store).is_empty());
+    }
+
+    #[test]
+    fn off_while_connected_without_the_connection_prop_is_a_row() {
+        let (_dir, store) = store();
+        let mut objects = dump(WITH_EARBUDS);
+        let card = objects
+            .iter_mut()
+            .find(|object| object["id"] == json!(98))
+            .expect("the card");
+        card["info"]["props"]
+            .as_object_mut()
+            .expect("props")
+            .remove("api.bluez5.connection");
+
+        let mut observer = Observer::new(&store);
+        observer.on_monitor(&objects, T, true).unwrap();
+
+        let mut card = object(&objects, 98);
+        set(&mut card, "/info/params/Profile/0/name", json!("off"));
+        observer.on_monitor(&[card], T + 5, false).unwrap();
+        observer.flush_pending(T + 7).unwrap();
+
+        let row = only(&recorded(&store), kind::PROFILE_CHANGE);
+        assert_eq!(row.profile_after.as_deref(), Some("off"));
     }
 
     #[test]
     fn a_lost_balance_correction_is_one_row() {
         let (_dir, store) = store();
         let mut observer = baseline(&store, WITH_STREAMS, T);
-        assert!(recorded(&store).is_empty());
         let objects = dump(WITH_STREAMS);
 
         let mut meiro = object(&objects, 74);
@@ -1481,27 +2467,74 @@ mod tests {
             "/info/params/Props/0/channelVolumes",
             json!([1.0, 1.0]),
         );
-        observer.on_monitor(&[meiro.clone()], T + 5).unwrap();
+        observer.on_monitor(&[meiro.clone()], T + 5, false).unwrap();
 
         let rows = recorded(&store);
         let row = only(&rows, kind::BALANCE_DRIFT);
-        assert_eq!(row.at_unix, T + 5);
         assert_eq!(row.device.as_deref(), Some("bluez_card.1C_0A_E0_A3_E2_D0"));
         assert_eq!(row.codec.as_deref(), Some("sbc"));
-        assert!(row.detail.as_deref().unwrap().contains("Meiro"));
-        assert!(row.detail.as_deref().unwrap().contains("lost"));
+        assert!(row.detail.as_deref().unwrap().contains("was lost"));
 
-        observer.on_monitor(&[meiro], T + 6).unwrap();
+        observer.on_monitor(&[meiro], T + 6, false).unwrap();
         assert_eq!(count(&recorded(&store), kind::BALANCE_DRIFT), 1);
+    }
 
-        let mut fixed = object(&objects, 74);
+    #[test]
+    fn a_balance_change_during_a_teardown_records_nothing() {
+        let (_dir, store) = store();
+        let mut observer = baseline(&store, WITH_STREAMS, T);
+        let objects = dump(WITH_STREAMS);
+
+        let mut card = object(&objects, 98);
+        set(&mut card, "/info/params/Profile/0/name", json!("off"));
+        observer.on_monitor(&[card], T + 5, false).unwrap();
+
+        let mut meiro = object(&objects, 74);
         set(
-            &mut fixed,
+            &mut meiro,
             "/info/params/Props/0/channelVolumes",
-            json!([0.19952, 1.0]),
+            json!([1.0, 1.0]),
         );
-        observer.on_monitor(&[fixed], T + 7).unwrap();
-        assert_eq!(count(&recorded(&store), kind::BALANCE_DRIFT), 1);
+        observer.on_monitor(&[meiro], T + 5, false).unwrap();
+        remove(&mut observer, 98, T + 6);
+        observer.flush_pending(T + 8).unwrap();
+
+        assert!(recorded(&store).is_empty());
+    }
+
+    #[test]
+    fn a_partial_balance_loss_is_one_row() {
+        let (_dir, store) = store();
+        let mut observer = baseline(&store, WITH_STREAMS, T);
+        let objects = dump(WITH_STREAMS);
+
+        let mut meiro = object(&objects, 74);
+        set(
+            &mut meiro,
+            "/info/params/Props/0/channelVolumes",
+            json!([0.708, 1.0]),
+        );
+        observer.on_monitor(&[meiro], T + 5, false).unwrap();
+
+        let row = only(&recorded(&store), kind::BALANCE_DRIFT);
+        assert!(row.detail.as_deref().unwrap().contains("weakened"));
+    }
+
+    #[test]
+    fn a_small_balance_change_is_not_a_row() {
+        let (_dir, store) = store();
+        let mut observer = baseline(&store, WITH_STREAMS, T);
+        let objects = dump(WITH_STREAMS);
+
+        let mut meiro = object(&objects, 74);
+        set(
+            &mut meiro,
+            "/info/params/Props/0/channelVolumes",
+            json!([0.251, 1.0]),
+        );
+        observer.on_monitor(&[meiro], T + 5, false).unwrap();
+
+        assert_eq!(count(&recorded(&store), kind::BALANCE_DRIFT), 0);
     }
 
     #[test]
@@ -1519,21 +2552,25 @@ mod tests {
             "/info/params/Props/0/channelVolumes",
             json!([]),
         );
-        observer.on_monitor(&[stream.clone()], T + 5).unwrap();
+        observer
+            .on_monitor(&[stream.clone()], T + 5, false)
+            .unwrap();
 
         set(
             &mut stream,
             "/info/params/Props/0/channelVolumes",
             json!([1.0, 1.0]),
         );
-        observer.on_monitor(&[stream.clone()], T + 6).unwrap();
+        observer
+            .on_monitor(&[stream.clone()], T + 6, false)
+            .unwrap();
 
         set(
             &mut stream,
             "/info/params/Props/0/channelVolumes",
             json!([0.19952, 1.0]),
         );
-        observer.on_monitor(&[stream], T + 7).unwrap();
+        observer.on_monitor(&[stream], T + 7, false).unwrap();
 
         assert_eq!(count(&recorded(&store), kind::BALANCE_DRIFT), 0);
     }
@@ -1554,16 +2591,51 @@ mod tests {
             "/info/params/Props/0/channelVolumes",
             json!([0.19952, 1.0]),
         );
-        observer.on_monitor(&[stream.clone()], T + 5).unwrap();
+        observer
+            .on_monitor(&[stream.clone()], T + 5, false)
+            .unwrap();
 
         set(
             &mut stream,
             "/info/params/Props/0/channelVolumes",
             json!([1.0, 1.0]),
         );
-        observer.on_monitor(&[stream], T + 6).unwrap();
+        observer.on_monitor(&[stream], T + 6, false).unwrap();
 
         assert_eq!(count(&recorded(&store), kind::BALANCE_DRIFT), 0);
+    }
+
+    #[test]
+    fn a_reversed_channel_map_is_handled() {
+        let (_dir, store) = store();
+        let mut objects = dump(WITH_STREAMS);
+        let meiro = objects
+            .iter_mut()
+            .find(|object| object["id"] == json!(74))
+            .expect("Meiro");
+        set(
+            meiro,
+            "/info/params/Props/0/channelVolumes",
+            json!([1.0, 0.19952]),
+        );
+        set(
+            meiro,
+            "/info/params/Props/0/channelMap",
+            json!(["FR", "FL"]),
+        );
+
+        let mut observer = Observer::new(&store);
+        observer.on_monitor(&objects, T, true).unwrap();
+
+        let mut meiro = object(&objects, 74);
+        set(
+            &mut meiro,
+            "/info/params/Props/0/channelVolumes",
+            json!([1.0, 1.0]),
+        );
+        observer.on_monitor(&[meiro], T + 5, false).unwrap();
+
+        assert_eq!(count(&recorded(&store), kind::BALANCE_DRIFT), 1);
     }
 
     #[test]
@@ -1581,29 +2653,62 @@ mod tests {
         );
 
         let mut observer = Observer::new(&store);
-        observer.on_monitor(&objects, T).unwrap();
+        observer.on_monitor(&objects, T, true).unwrap();
 
         assert!(recorded(&store).is_empty());
     }
 
     #[test]
-    fn replays_the_real_disconnect_and_reconnect() {
+    fn a_flushed_transport_survives_a_later_disconnect() {
         let (_dir, store) = store();
-        let mut observer = Observer::new(&store);
+        let mut observer = baseline(&store, WITH_EARBUDS, T);
 
-        for (index, line) in LIVE.lines().enumerate() {
-            let array: Vec<Value> = serde_json::from_str(line).expect("a real monitor array");
-            observer
-                .on_monitor(&array, T + index as i64)
-                .expect("apply a real monitor array");
-        }
+        observer
+            .on_journal(journal_at("Failure in Bluetooth audio transport", T + 5))
+            .unwrap();
+        observer.flush_pending(T + 7).unwrap();
+        remove(&mut observer, 98, T + 8);
 
         let rows = recorded(&store);
-        let row = only(&rows, kind::DISCONNECT);
-        assert_eq!(row.device.as_deref(), Some("bluez_card.1C_0A_E0_A3_E2_D0"));
-        assert_eq!(row.profile_before.as_deref(), Some("a2dp-sink-sbc"));
-        assert_eq!(row.codec.as_deref(), Some("sbc"));
-        assert_eq!(count(&rows, kind::PROFILE_CHANGE), 0);
-        assert_eq!(count(&rows, kind::CODEC_CHANGE), 0);
+        assert_eq!(rows.len(), 1, "rows: {rows:#?}");
+        assert_eq!(count(&rows, kind::TRANSPORT_FAILURE), 1);
+    }
+
+    #[test]
+    fn a_second_watch_lock_is_refused() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("watch.lock");
+
+        let first = WatchLock::acquire(&path).expect("the first lock");
+        let error = WatchLock::acquire(&path).expect_err("the second lock");
+        assert!(error.to_string().contains("already running"), "{error:#}");
+
+        drop(first);
+        WatchLock::acquire(&path).expect("the lock is free again");
+    }
+
+    #[test]
+    fn a_journal_cursor_round_trips() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("journal.cursor");
+        let mut cursor = CursorFile::new(path.clone());
+        assert_eq!(cursor.read().unwrap(), None);
+
+        let line = journal_at("Failure in Bluetooth audio transport", T + 5);
+        cursor.save_for(&line).unwrap();
+        assert_eq!(cursor.read().unwrap().as_deref(), Some("cursor-1700000005"));
+        assert!(!path.with_extension("cursor.tmp").exists());
+    }
+
+    #[test]
+    fn journal_args_resumes_from_a_cursor() {
+        let tail = journal_args(None);
+        assert!(tail.iter().any(|arg| arg == "-n"));
+        assert!(tail.iter().any(|arg| arg == "0"));
+        assert!(!tail.iter().any(|arg| arg.starts_with("--after-cursor=")));
+
+        let resume = journal_args(Some("s=abc;i=42"));
+        assert!(resume.iter().any(|arg| arg == "--after-cursor=s=abc;i=42"));
+        assert!(!resume.iter().any(|arg| arg == "-n"));
     }
 }

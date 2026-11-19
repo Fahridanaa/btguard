@@ -154,9 +154,9 @@ What it contains:
 - The updated `codec` and `profile` values are real; they are not edited.
 
 The test `replays_the_real_disconnect_and_reconnect` feeds every line to the
-observer and asserts one `disconnect` row with the last working profile
-(`a2dp-sink-sbc`), one codec (`sbc`), and no `profile-change` or `codec-change`
-rows for the `off` transitions.
+observer and asserts that the normal disconnect and reconnect make no rows.
+The `off` profile changes and the card removal are a teardown; the new card's
+`off -> a2dp` is a connect.
 
 ## Rules
 

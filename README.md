@@ -46,7 +46,8 @@ $ journalctl --since "7 days ago" | grep -c "Failure in Bluetooth audio transpor
 ```
 
 The two lines are from Nov 14 and Nov 16. The rate is lower than 90 per 3 days,
-but it is not zero. The live disconnect test added one more at 17:38.
+but it is not zero. The live disconnect test added one more at 17:38; that
+line is a teardown line, so the incident log does not record it.
 
 This repository does not change those files. It watches the stack they run on.
 
@@ -101,76 +102,74 @@ No incidents since 2026-11-16 16:48:10 (3d).
 ```
 $ btguard watch
 btguard watch: database /home/fahridanaa/.local/state/bt-audio-guard/incidents.db
-btguard watch: watching pw-dump --monitor and journalctl -f
 btguard watch: baseline: 1 card(s), 2 output stream(s): bluez_card.1C_0A_E0_A3_E2_D0
 ```
 
-It starts two child processes and never polls:
+The store is an incident log, not a transition log. The watcher starts two
+child processes and never polls:
 
 | Input | What it reads |
 |---|---|
-| `pw-dump --monitor` | The full graph first, then one JSON array per change: card profile, codec, default sink, nodes, streams and links. |
-| `journalctl --follow --output=json -n 0` | New journal lines from `bluetoothd`, the kernel, and WirePlumber's `spa.bluez5` lines. |
+| `pw-dump --monitor` | The full graph first, then one JSON array per change. A later full array after a restart is reconciled against the old graph. |
+| `journalctl --follow --output=json --no-pager` | New journal lines from `bluetoothd`, the kernel, and WirePlumber's `spa.bluez5` lines. The first run starts at `-n 0`; a restart resumes from the saved cursor. |
 
-A row is recorded for these transitions:
+A row is recorded only for a real deviation:
 
 | Kind | When |
 |---|---|
-| `profile-change` | A Bluetooth card's `info.params.Profile[0].name` changes. The profile param is live; `bluez5.profile` can read `off`. |
-| `codec-change` | The codec of a card's sink or source changes while the profile stays the same. A sink that disappears is not a codec change. |
-| `disconnect` | A connected card says `disconnected` or is removed from the graph. The removal after a disconnect is not a second row. |
-| `transport-failure` | A WirePlumber line contains `Failure in Bluetooth audio transport`. A burst in one second is one row. |
-| `sco-orphan` | A kernel line contains `SCO packet for unknown connection handle`. A burst in one second is one row. |
-| `balance-drift` | A stream on the earbud sink was corrected (left at least 6 dB below right) and then lost that attenuation (left within 1 dB of right, or louder). The row names the stream and both volumes. |
+| `profile-change` | A connected card changes profile. A change to `off` is a teardown; it makes a row only if the card stays connected and silent for the whole window. |
+| `codec-change` | The codec of a card's sink or source changes while no profile row covers it. A codec update within one second of a profile row folds into that row. |
+| `transport-failure` | A WirePlumber line contains `Failure in Bluetooth audio transport` while the card stays connected. The row waits for the teardown window. |
+| `sco-orphan` | A kernel line contains `SCO packet for unknown connection handle` while the card stays connected. |
+| `balance-drift` | A stream on the earbud sink was corrected (left at least 6 dB below right) and the correction dropped by at least 3 dB, including a full loss. |
 
-The first `pw-dump --monitor` array sets the baseline. It records no incidents,
-so a restart does not invent a profile change for every card.
+A normal disconnect makes no row. It cancels a pending episode that started
+within one second. A transport or SCO line in that window is part of the
+teardown and makes no row. A real transport failure while the card stays
+connected makes one row after the window.
 
-**Same-second journal.** The watcher keeps the last 10 seconds of relevant
-journal lines. A line that arrives before a graph event is attached when the
-row is written. A line that arrives after it is appended to the rows of that
-second. A profile change and a transport failure in the same second therefore
-share the same journal text.
+**One row per deviation.** A profile change and a transport failure within one
+second are one row, not two. An AAC selection that arrives as a card update
+and then a sink codec update is one row, with the new codec filled in. A burst
+of journal lines that crosses a second boundary is one row.
 
-**Balance drift has a limit.** A stream that arrives flat and never receives
-the correction is not a row. That condition needs a timer, and this observer
-does not infer incidents from timers. Recorded drift means a correction that
-was present and then disappeared.
+**Journal window.** The watcher keeps the last 10 seconds of relevant journal
+lines. A line within one second of a row is attached to it, before or after the
+row is written.
+
+**Off while connected.** A connected card on `off` is silent. The watcher holds
+the transition for the teardown window. If the card disconnects or returns to
+an audio profile, no row; if it stays off, one `profile-change` row. The first
+array of a watcher start is the baseline; a full array after a restart is
+reconciled against the old graph, so the restart itself does not invent rows.
+
+**Restarts.** If `pw-dump` or `journalctl` stops, the watcher restarts it. A
+new `pw-dump` full array is reconciled against the old graph. `journalctl`
+resumes from `$XDG_STATE_HOME/bt-audio-guard/journal.cursor`. If the cursor is
+rejected, it starts at the live tail and logs why. A lock file stops a second
+`btguard watch` from double-recording.
+
+**Balance has a limit.** A stream that arrives flat and never receives the
+correction is not a row. That condition needs a timer, and this observer does
+not infer incidents from timers. A partial loss of an existing correction is a
+row.
 
 The watcher only reads. It does not change the card profile, the volumes, the
 WirePlumber files or `earbud-balance`.
 
-A live disconnect on 2026-11-19 produced two rows, both with the journal lines
-from the same second:
-
-```
-2026-11-19 17:38:11  transport-failure
-    device   bluez_card.1C_0A_E0_A3_E2_D0
-    | spa.bluez5.sink.media: 0x562ec5afd2e8: connection (/org/bluez/hci0/dev_1C_0A_E0_A3_E2_D0/sep1/fd0) terminated unexpectedly
-    | pw.node: (bluez_output.1C_0A_E0_A3_E2_D0.1-81) running -> error (Received error event)
-    | spa.bluez5: Failure in Bluetooth audio transport /org/bluez/hci0/dev_1C_0A_E0_A3_E2_D0/sep1/fd0
-    | pw.node: (bluez_output.1C_0A_E0_A3_E2_D0.1-81) running -> error (Received error event)
-
-2026-11-19 17:38:11  disconnect
-    device   bluez_card.1C_0A_E0_A3_E2_D0
-    profile  a2dp-sink-sbc
-    codec    sbc
-    detail   Bluetooth card disconnected
-    | spa.bluez5.sink.media: 0x562ec5afd2e8: connection (/org/bluez/hci0/dev_1C_0A_E0_A3_E2_D0/sep1/fd0) terminated unexpectedly
-    | pw.node: (bluez_output.1C_0A_E0_A3_E2_D0.1-81) running -> error (Received error event)
-    | spa.bluez5: Failure in Bluetooth audio transport /org/bluez/hci0/dev_1C_0A_E0_A3_E2_D0/sep1/fd0
-    | pw.node: (bluez_output.1C_0A_E0_A3_E2_D0.1-81) running -> error (Received error event)
-```
-
-The reconnect added no row. The card came back as `off`, then settled on
-`a2dp-sink-sbc`; neither transition is an incident.
+The real 2026-11-19 disconnect and reconnect in
+`tests/fixtures/pw-monitor-live.jsonl` now replay to 0 rows. The process tests
+use fake children to prove that a dying input does not lose the journal line
+and that the journal resumes from the cursor. A transport-failure line while
+the card stays connected records one row; see
+`a_transport_failure_while_connected_is_one_row`.
 
 ## Data sources
 
 | Source | Status | What it gives |
 |---|---|---|
-| `pw-dump --monitor` | Used by `watch` | Card profile, codec, default sink, nodes, streams and links. |
-| `journalctl -f` | Used by `watch` | `bluetoothd`, kernel Bluetooth lines and WirePlumber `spa.bluez5` lines. The transport failure itself is a WirePlumber line, not a `bluetoothd` line. |
+| `pw-dump --monitor` | Used by `watch` | Card profile, codec, default sink, nodes, streams and links. The first array is a full snapshot; a restart starts a new one. |
+| `journalctl -f` | Used by `watch` | `bluetoothd`, kernel Bluetooth lines and WirePlumber `spa.bluez5` lines. The transport failure itself is a WirePlumber line, not a `bluetoothd` line. A restart resumes from the saved cursor. |
 | BlueZ D-Bus | Not used yet | `org.bluez.Battery1`. This unit does not expose it (`No such interface 'org.bluez.Battery1'`), so the widget must handle a missing battery. |
 | `pactl subscribe` | Not used | `earbud-balance` uses it today. `pw-dump --monitor` already reports stream volumes. |
 
@@ -182,15 +181,18 @@ The reconnect added no row. The card came back as `off`, then settled on
 |---|---|
 | `id` | Row id. |
 | `at_unix` | Seconds since the Unix epoch, UTC. |
-| `kind` | `transport-failure`, `sco-orphan`, `profile-change`, `codec-change`, `disconnect` or `balance-drift`. |
+| `kind` | `transport-failure`, `sco-orphan`, `profile-change`, `codec-change` or `balance-drift`. |
 | `device` | The card or node name, such as `bluez_card.1C_0A_E0_A3_E2_D0`. |
 | `profile_before`, `profile_after` | The card profile around the incident. |
 | `codec` | The codec in use. |
 | `detail` | Free text from the observer. |
-| `journal` | The journal lines from the same second, one per line. |
+| `journal` | The journal lines within one second, one per line. |
+
+A normal disconnect is not a kind and not a row. It is a transition.
 
 The database is `$XDG_STATE_HOME/bt-audio-guard/incidents.db`, or
-`~/.local/state/bt-audio-guard/incidents.db`. It uses WAL mode.
+`~/.local/state/bt-audio-guard/incidents.db`. It uses WAL mode. The watcher
+keeps `journal.cursor` and `watch.lock` beside it.
 
 ## Field notes
 
@@ -208,18 +210,35 @@ These are measured on this machine, not assumed.
   JSON.** PipeWire 1.6.11 writes the full graph as one pretty-printed array,
   then one more array for each change. A removal is a small array with no
   `type`: `[{"id": 98, "info": null}]`. It is not one endless array either: the
-  initial array closes with `]` before the events start. The reader in
-  `src/watch.rs` follows braces and strings; a line reader fails.
+  initial array closes with `]` before the events start. A restarted
+  `pw-dump` starts again with a full array, and the watcher reconciles it
+  against the old graph. The reader in `src/watch.rs` follows braces and
+  strings; a line reader fails.
 - **The transport failure is a WirePlumber line.** It is
   `spa.bluez5: Failure in Bluetooth audio transport ...` with
   `SYSLOG_IDENTIFIER=wireplumber`, not a `bluetoothd` line. A watcher that only
   follows `bluetoothd` and the kernel cannot see it. The SCO line is a kernel
   line: `Bluetooth: hci0: SCO packet for unknown connection handle N`.
+- **A normal disconnect is not a row.** The card reports `off` and then leaves
+  the graph. The watcher cancels a pending episode that started within one
+  second, so the `off` profile and the teardown transport lines make no row. A
+  transport line while the card stays connected makes one row.
+- **`journalctl --after-cursor` resumes a gap.** On 2026-11-19 a cursor from
+  the current journal replayed a line written after the follower started. The
+  watcher saves `__CURSOR` after every relevant line and restarts `journalctl`
+  with `--after-cursor`. Without it, a 3 s service restart loses the lines in
+  the gap.
+- **A card removed without `api.bluez5.connection` is still handled.** The
+  property is optional. A present card with no value is treated as connected
+  or unknown; the removal is recognized and cancels a pending episode. A
+  connected card on `off` with no value still makes the silent-card row.
 - **Stream volumes are linear, not decibels.** A corrected stream has
   `channelVolumes: [0.199520, 1.000000]`, which is 14 dB below the right
   channel. A flat stream has `[1.0, 1.0]`. The sink has its own volumes
   (`[0.140608, 0.140608]` in the capture); the balance correction lives on the
-  stream nodes.
+  stream nodes. A correction that drops by 3 dB or more is a partial loss and
+  makes a row. The `channelMap` decides which channel is left; a reversed map
+  is handled.
 - **A stream's sink comes from two places.** `target.object` names it when the
   application sets one (`Sober`). When it is absent (`Meiro`), the Link objects
   connect the stream's output node to the sink's node.
@@ -240,6 +259,7 @@ src/duration.rs  --since spans
 src/paths.rs     state directory
 systemd/         the user unit, not installed by this repo
 tests/fixtures/  real pw-dump and journal captures
+tests/watch_process.rs  fake-child tests for restarts and the lock
 policy/          WirePlumber Lua policy, later
 widget/          DMS bar widget, later
 ```
@@ -270,8 +290,9 @@ systemctl --user enable --now btguard-watch.service
 ```
 
 The unit runs `Restart=always` with `RestartSec=3`, like
-`earbud-balance.service`, and uses `KillMode=control-group` so a stop also stops
-`pw-dump` and `journalctl`.
+`earbud-balance.service`, uses `KillMode=control-group` so a stop also stops
+`pw-dump` and `journalctl`, and `Wants=pipewire.service wireplumber.service` so
+the order is explicit.
 
 ## Next
 
