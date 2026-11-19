@@ -1,13 +1,15 @@
 //! btguard: observe Bluetooth audio on PipeWire and record incidents.
 //!
-//! This first version reads the live graph and the incident store. It does not
-//! enforce policy and it does not run as a daemon yet. See README.md.
+//! `status` and `incidents` read the live graph and the store. `watch` is the
+//! observer that writes rows. This version does not enforce policy. See
+//! README.md.
 
 mod cli;
 mod duration;
 mod paths;
 mod pw;
 mod store;
+mod watch;
 
 use std::process::ExitCode;
 
@@ -32,6 +34,7 @@ fn main() -> ExitCode {
 fn run() -> Result<()> {
     match Cli::parse().command {
         Command::Status => status(),
+        Command::Watch => watch::watch(),
         Command::Incidents { since, limit } => incidents(since, limit),
     }
 }

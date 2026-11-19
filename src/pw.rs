@@ -17,8 +17,8 @@ pub struct Card {
     pub profile_description: Option<String>,
 }
 
-/// A Bluetooth audio node: the sink or the source of a card.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// A PipeWire audio node: a sink, a source or an application stream.
+#[derive(Debug, Clone, PartialEq)]
 pub struct Node {
     pub id: u64,
     pub name: String,
@@ -27,9 +27,24 @@ pub struct Node {
     pub codec: Option<String>,
     pub profile: Option<String>,
     pub device_id: Option<u64>,
+    /// Linear channel volumes from `info.params.Props[0].channelVolumes`.
+    pub channel_volumes: Vec<f64>,
+    pub channel_map: Vec<String>,
+    /// `target.object` when the stream names its sink or source.
+    pub target_object: Option<String>,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+impl Node {
+    /// True for a node that belongs to a Bluetooth card. `bluez_midi.server`
+    /// is a `Midi/Bridge`, so it is never in `Snapshot.nodes`.
+    pub fn is_bluez_audio(&self) -> bool {
+        self.name.starts_with("bluez_output.")
+            || self.name.starts_with("bluez_input.")
+            || self.codec.is_some()
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct Snapshot {
     pub core_version: Option<String>,
     pub default_sink: Option<String>,
@@ -81,7 +96,9 @@ impl Snapshot {
                     }
                 }
                 Some("PipeWire:Interface:Node") => {
-                    if let Some(node) = Node::from_object(object) {
+                    if let Some(node) = Node::from_object(object)
+                        && node.is_bluez_audio()
+                    {
                         snapshot.nodes.push(node);
                     }
                 }
@@ -95,16 +112,8 @@ impl Snapshot {
     /// `default.audio.sink` holds the sink in use. `default.configured.*` is
     /// only what WirePlumber saved, and can name a device that is not present.
     fn read_default_sink(&mut self, object: &Value) {
-        let Some(entries) = object.get("metadata").and_then(Value::as_array) else {
-            return;
-        };
-        for entry in entries {
-            if entry.get("key").and_then(Value::as_str) == Some("default.audio.sink") {
-                self.default_sink = entry
-                    .pointer("/value/name")
-                    .and_then(Value::as_str)
-                    .map(str::to_owned);
-            }
+        if let Some(name) = default_sink_from_metadata(object) {
+            self.default_sink = Some(name.to_owned());
         }
     }
 
@@ -124,7 +133,7 @@ impl Snapshot {
 }
 
 impl Card {
-    fn from_object(object: &Value) -> Option<Self> {
+    pub(crate) fn from_object(object: &Value) -> Option<Self> {
         let props = props(object)?;
         if text(props, "device.api") != Some("bluez5") {
             return None;
@@ -150,29 +159,79 @@ impl Card {
 }
 
 impl Node {
-    fn from_object(object: &Value) -> Option<Self> {
+    pub(crate) fn from_object(object: &Value) -> Option<Self> {
         let props = props(object)?;
         let name = text(props, "node.name")?;
+        let media_class = text(props, "media.class").unwrap_or_default();
 
-        let is_bluez_audio = name.starts_with("bluez_output.") || name.starts_with("bluez_input.");
-        if !is_bluez_audio && text(props, "api.bluez5.codec").is_none() {
+        // Keep the audio graph only. This drops `bluez_midi.server`, which is
+        // a Midi/Bridge node with `api.bluez5.*` properties.
+        if !matches!(
+            media_class,
+            "Audio/Sink" | "Audio/Source" | "Stream/Output/Audio" | "Stream/Input/Audio"
+        ) {
             return None;
         }
+
+        let (channel_volumes, channel_map) = node_volumes(object);
 
         Some(Self {
             id: object.get("id")?.as_u64()?,
             name: name.to_owned(),
             description: text(props, "node.description").map(str::to_owned),
-            media_class: text(props, "media.class").unwrap_or_default().to_owned(),
+            media_class: media_class.to_owned(),
             codec: text(props, "api.bluez5.codec").map(str::to_owned),
             profile: text(props, "api.bluez5.profile").map(str::to_owned),
             device_id: number(props, "device.id"),
+            channel_volumes,
+            channel_map,
+            target_object: text(props, "target.object").map(str::to_owned),
         })
     }
 }
 
+fn node_volumes(object: &Value) -> (Vec<f64>, Vec<String>) {
+    let Some(props) = object
+        .pointer("/info/params/Props")
+        .and_then(Value::as_array)
+        .and_then(|list| list.first())
+    else {
+        return (Vec::new(), Vec::new());
+    };
+
+    let volumes = props
+        .get("channelVolumes")
+        .and_then(Value::as_array)
+        .map(|list| list.iter().filter_map(Value::as_f64).collect())
+        .unwrap_or_default();
+    let map = props
+        .get("channelMap")
+        .and_then(Value::as_array)
+        .map(|list| {
+            list.iter()
+                .filter_map(Value::as_str)
+                .map(str::to_owned)
+                .collect()
+        })
+        .unwrap_or_default();
+
+    (volumes, map)
+}
+
 fn props(object: &Value) -> Option<&Map<String, Value>> {
     object.get("info")?.get("props")?.as_object()
+}
+
+/// The sink in use from a `default` Metadata object. `default.configured.*`
+/// is only what WirePlumber saved, so it is not read here.
+pub(crate) fn default_sink_from_metadata(object: &Value) -> Option<&str> {
+    object
+        .get("metadata")?
+        .as_array()?
+        .iter()
+        .find(|entry| entry.get("key").and_then(Value::as_str) == Some("default.audio.sink"))
+        .and_then(|entry| entry.pointer("/value/name"))
+        .and_then(Value::as_str)
 }
 
 fn text<'a>(props: &'a Map<String, Value>, key: &str) -> Option<&'a str> {
@@ -241,6 +300,10 @@ mod tests {
         assert_eq!(sink.name, "bluez_output.1C_0A_E0_A3_E2_D0.1");
         assert_eq!(sink.codec.as_deref(), Some("sbc"));
         assert_eq!(sink.media_class, "Audio/Sink");
+        // Linear channel volumes from the real capture. The sink volume is not
+        // the per-stream balance correction; streams carry their own volumes.
+        assert_eq!(sink.channel_volumes, vec![0.140608, 0.140608]);
+        assert_eq!(sink.channel_map, ["FL", "FR"]);
         assert!(snapshot.source_for(card).is_none(), "no HFP source");
     }
 

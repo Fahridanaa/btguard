@@ -1,0 +1,13 @@
+[Unit]
+Description=Record Bluetooth audio incidents on PipeWire
+After=pipewire.service wireplumber.service
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/btguard watch
+Restart=always
+RestartSec=3
+KillMode=control-group
+
+[Install]
+WantedBy=default.target

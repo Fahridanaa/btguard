@@ -29,9 +29,6 @@ CREATE INDEX incidents_at_unix ON incidents(at_unix);
 "#;
 
 /// The incident kinds this tool records. Keep the list in sync with the README.
-///
-/// The watcher, which is not written yet, is the only producer.
-#[allow(dead_code)]
 pub mod kind {
     pub const TRANSPORT_FAILURE: &str = "transport-failure";
     pub const SCO_ORPHAN: &str = "sco-orphan";
@@ -93,8 +90,7 @@ impl Store {
         Ok(Self { conn })
     }
 
-    /// Record one incident. The watcher calls this; today only the tests do.
-    #[allow(dead_code)]
+    /// Record one incident. The watcher is the only producer.
     pub fn insert(&self, incident: &Incident) -> Result<i64> {
         self.conn.execute(
             "INSERT INTO incidents
@@ -112,6 +108,21 @@ impl Store {
             ],
         )?;
         Ok(self.conn.last_insert_rowid())
+    }
+
+    /// Add one journal line to an incident that is already recorded. The
+    /// watcher uses this to attach lines that arrive after the event.
+    pub fn append_journal(&self, id: i64, line: &str) -> Result<()> {
+        self.conn.execute(
+            "UPDATE incidents
+             SET journal = CASE
+                 WHEN journal IS NULL OR journal = '' THEN ?2
+                 ELSE journal || char(10) || ?2
+             END
+             WHERE id = ?1",
+            params![id, line],
+        )?;
+        Ok(())
     }
 
     pub fn summary(&self) -> Result<Summary> {
@@ -242,5 +253,19 @@ mod tests {
             .unwrap();
         assert_eq!(store.since(1_700_000_000, 10).unwrap().len(), 1);
         assert!(store.since(1_700_000_001, 10).unwrap().is_empty());
+    }
+
+    #[test]
+    fn journal_lines_append_to_an_existing_row() {
+        let (_dir, store) = store();
+        let mut incident = sample(1_700_000_000, kind::PROFILE_CHANGE);
+        incident.journal = None;
+        let id = store.insert(&incident).unwrap();
+
+        store.append_journal(id, "first line").unwrap();
+        store.append_journal(id, "second line").unwrap();
+
+        let rows = store.since(0, 10).unwrap();
+        assert_eq!(rows[0].journal.as_deref(), Some("first line\nsecond line"));
     }
 }

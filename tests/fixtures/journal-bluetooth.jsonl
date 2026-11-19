@@ -1,0 +1,9 @@
+{"__REALTIME_TIMESTAMP":"1792067006151330","SYSLOG_IDENTIFIER":"wireplumber","_TRANSPORT":"journal","MESSAGE":"spa.bluez5: Failure in Bluetooth audio transport /org/bluez/hci0/dev_1C_0A_E0_A3_E2_D0/sep2/fd0"}
+{"__REALTIME_TIMESTAMP":"1792067373659734","SYSLOG_IDENTIFIER":"kernel","_TRANSPORT":"kernel","MESSAGE":"Bluetooth: hci0: SCO packet for unknown connection handle 2"}
+{"__REALTIME_TIMESTAMP":"1792070112470769","SYSLOG_IDENTIFIER":"kernel","_TRANSPORT":"kernel","MESSAGE":"Bluetooth: hci0: SCO packet for unknown connection handle 4"}
+{"__REALTIME_TIMESTAMP":"1794670578722714","SYSLOG_IDENTIFIER":"wireplumber","_TRANSPORT":"journal","MESSAGE":"spa.bluez5: Failure in Bluetooth audio transport /org/bluez/hci0/dev_1C_0A_E0_A3_E2_D0/sep1/fd0"}
+{"__REALTIME_TIMESTAMP":"1794830708564402","SYSLOG_IDENTIFIER":"wireplumber","_TRANSPORT":"journal","MESSAGE":"spa.bluez5.sink.media: 0x561034924798: connection (/org/bluez/hci0/dev_1C_0A_E0_A3_E2_D0/sep1/fd0) terminated unexpectedly"}
+{"__REALTIME_TIMESTAMP":"1794830708589459","SYSLOG_IDENTIFIER":"wireplumber","_TRANSPORT":"journal","MESSAGE":"spa.bluez5: Failure in Bluetooth audio transport /org/bluez/hci0/dev_1C_0A_E0_A3_E2_D0/sep1/fd0"}
+{"__REALTIME_TIMESTAMP":"1794830743835355","SYSLOG_IDENTIFIER":"bluetoothd","_TRANSPORT":"syslog","MESSAGE":"/org/bluez/hci0/dev_1C_0A_E0_A3_E2_D0/sep1/fd0: fd(29) ready"}
+{"__REALTIME_TIMESTAMP":"1795071866540822","SYSLOG_IDENTIFIER":"kernel","_TRANSPORT":"kernel","MESSAGE":"Bluetooth: SCO socket layer initialized"}
+{"__REALTIME_TIMESTAMP":"1795082283865377","SYSLOG_IDENTIFIER":"kernel","_TRANSPORT":"kernel","MESSAGE":"usb 3-1: New USB device strings: Mfr=1, Product=2, SerialNumber=3"}

@@ -4,8 +4,9 @@ An observer for Bluetooth audio on PipeWire. It records what goes wrong with
 the soundcore R50i earbuds on this laptop, so a failure becomes a row in a
 table instead of a silent game and a crashed shell.
 
-**Status: skeleton.** `btguard status` and `btguard incidents` work. The
-watcher, the WirePlumber policy and the DMS widget do not exist yet.
+**Status: observer.** `btguard status`, `btguard incidents` and `btguard watch`
+work. The watcher records incidents; it does not enforce policy. The
+WirePlumber policy and the DMS widget do not exist yet.
 
 ## The problem
 
@@ -37,7 +38,7 @@ headset voice link.
 | `~/.config/wireplumber/wireplumber.conf.d/51-nvidia-hdmi-deprioritize.conf` | Drops the dead NVIDIA HDMI nodes to priority 1, so they cannot win default-node selection. |
 | `~/.local/bin/earbud-balance` and `~/.config/systemd/user/earbud-balance.service` | Attenuates the left channel of each stream by 14 dB, and removes the split from streams on other sinks. |
 
-Measured on 2026-11-19:
+Measured on 2026-11-19, before the live disconnect test:
 
 ```
 $ journalctl --since "7 days ago" | grep -c "Failure in Bluetooth audio transport"
@@ -45,7 +46,7 @@ $ journalctl --since "7 days ago" | grep -c "Failure in Bluetooth audio transpor
 ```
 
 The two lines are from Nov 14 and Nov 16. The rate is lower than 90 per 3 days,
-but it is not zero.
+but it is not zero. The live disconnect test added one more at 17:38.
 
 This repository does not change those files. It watches the stack they run on.
 
@@ -53,7 +54,7 @@ This repository does not change those files. It watches the stack they run on.
 
 The hand fix is policy without a record. This project adds the record first.
 
-- **Observe.** Watch the graph, the journal and BlueZ. Store each incident with
+- **Observe.** Watch the graph and the journal, and store each incident with
   the journal lines from the same second.
 - **Decide later.** After one week of data, decide what to enforce. Do not
   guess now.
@@ -93,16 +94,85 @@ $ btguard incidents --since 3d
 No incidents since 2026-11-16 16:48:10 (3d).
 ```
 
-`incidents` reads an empty table today, because nothing writes to it yet.
+`incidents` reads the table that `watch` writes.
 
-## Planned data sources
+## The watcher
 
-| Source | What it gives |
+```
+$ btguard watch
+btguard watch: database /home/fahridanaa/.local/state/bt-audio-guard/incidents.db
+btguard watch: watching pw-dump --monitor and journalctl -f
+btguard watch: baseline: 1 card(s), 2 output stream(s): bluez_card.1C_0A_E0_A3_E2_D0
+```
+
+It starts two child processes and never polls:
+
+| Input | What it reads |
 |---|---|
-| `pw-dump --monitor` | Card profile, codec, default sink, nodes and streams. |
-| `journalctl -f` | bluetoothd and kernel lines, such as the transport failure and the SCO line. |
-| BlueZ D-Bus | `org.bluez.Battery1`. This unit does not expose it today (`No such interface 'org.bluez.Battery1'`), so the widget must handle a missing battery. |
-| `pactl subscribe` | Stream volume changes. `earbud-balance` uses this today. |
+| `pw-dump --monitor` | The full graph first, then one JSON array per change: card profile, codec, default sink, nodes, streams and links. |
+| `journalctl --follow --output=json -n 0` | New journal lines from `bluetoothd`, the kernel, and WirePlumber's `spa.bluez5` lines. |
+
+A row is recorded for these transitions:
+
+| Kind | When |
+|---|---|
+| `profile-change` | A Bluetooth card's `info.params.Profile[0].name` changes. The profile param is live; `bluez5.profile` can read `off`. |
+| `codec-change` | The codec of a card's sink or source changes while the profile stays the same. A sink that disappears is not a codec change. |
+| `disconnect` | A connected card says `disconnected` or is removed from the graph. The removal after a disconnect is not a second row. |
+| `transport-failure` | A WirePlumber line contains `Failure in Bluetooth audio transport`. A burst in one second is one row. |
+| `sco-orphan` | A kernel line contains `SCO packet for unknown connection handle`. A burst in one second is one row. |
+| `balance-drift` | A stream on the earbud sink was corrected (left at least 6 dB below right) and then lost that attenuation (left within 1 dB of right, or louder). The row names the stream and both volumes. |
+
+The first `pw-dump --monitor` array sets the baseline. It records no incidents,
+so a restart does not invent a profile change for every card.
+
+**Same-second journal.** The watcher keeps the last 10 seconds of relevant
+journal lines. A line that arrives before a graph event is attached when the
+row is written. A line that arrives after it is appended to the rows of that
+second. A profile change and a transport failure in the same second therefore
+share the same journal text.
+
+**Balance drift has a limit.** A stream that arrives flat and never receives
+the correction is not a row. That condition needs a timer, and this observer
+does not infer incidents from timers. Recorded drift means a correction that
+was present and then disappeared.
+
+The watcher only reads. It does not change the card profile, the volumes, the
+WirePlumber files or `earbud-balance`.
+
+A live disconnect on 2026-11-19 produced two rows, both with the journal lines
+from the same second:
+
+```
+2026-11-19 17:38:11  transport-failure
+    device   bluez_card.1C_0A_E0_A3_E2_D0
+    | spa.bluez5.sink.media: 0x562ec5afd2e8: connection (/org/bluez/hci0/dev_1C_0A_E0_A3_E2_D0/sep1/fd0) terminated unexpectedly
+    | pw.node: (bluez_output.1C_0A_E0_A3_E2_D0.1-81) running -> error (Received error event)
+    | spa.bluez5: Failure in Bluetooth audio transport /org/bluez/hci0/dev_1C_0A_E0_A3_E2_D0/sep1/fd0
+    | pw.node: (bluez_output.1C_0A_E0_A3_E2_D0.1-81) running -> error (Received error event)
+
+2026-11-19 17:38:11  disconnect
+    device   bluez_card.1C_0A_E0_A3_E2_D0
+    profile  a2dp-sink-sbc
+    codec    sbc
+    detail   Bluetooth card disconnected
+    | spa.bluez5.sink.media: 0x562ec5afd2e8: connection (/org/bluez/hci0/dev_1C_0A_E0_A3_E2_D0/sep1/fd0) terminated unexpectedly
+    | pw.node: (bluez_output.1C_0A_E0_A3_E2_D0.1-81) running -> error (Received error event)
+    | spa.bluez5: Failure in Bluetooth audio transport /org/bluez/hci0/dev_1C_0A_E0_A3_E2_D0/sep1/fd0
+    | pw.node: (bluez_output.1C_0A_E0_A3_E2_D0.1-81) running -> error (Received error event)
+```
+
+The reconnect added no row. The card came back as `off`, then settled on
+`a2dp-sink-sbc`; neither transition is an incident.
+
+## Data sources
+
+| Source | Status | What it gives |
+|---|---|---|
+| `pw-dump --monitor` | Used by `watch` | Card profile, codec, default sink, nodes, streams and links. |
+| `journalctl -f` | Used by `watch` | `bluetoothd`, kernel Bluetooth lines and WirePlumber `spa.bluez5` lines. The transport failure itself is a WirePlumber line, not a `bluetoothd` line. |
+| BlueZ D-Bus | Not used yet | `org.bluez.Battery1`. This unit does not expose it (`No such interface 'org.bluez.Battery1'`), so the widget must handle a missing battery. |
+| `pactl subscribe` | Not used | `earbud-balance` uses it today. `pw-dump --monitor` already reports stream volumes. |
 
 ## The incident table
 
@@ -134,10 +204,25 @@ These are measured on this machine, not assumed.
 - **`bluez_midi.server` is not audio.** It is a `Midi/Bridge` node with
   `api.bluez5.*` properties. Filter on `media.class` or the `bluez_output.` and
   `bluez_input.` prefixes.
-- **`pw-dump --monitor` is not line-delimited JSON.** PipeWire 1.6.11 writes a
-  pretty-printed array: `[`, objects separated by `,`, then `]`. It sends the
-  full initial state first. The watcher needs a brace-depth reader, not a line
-  reader.
+- **`pw-dump --monitor` is a sequence of JSON arrays, not line-delimited
+  JSON.** PipeWire 1.6.11 writes the full graph as one pretty-printed array,
+  then one more array for each change. A removal is a small array with no
+  `type`: `[{"id": 98, "info": null}]`. It is not one endless array either: the
+  initial array closes with `]` before the events start. The reader in
+  `src/watch.rs` follows braces and strings; a line reader fails.
+- **The transport failure is a WirePlumber line.** It is
+  `spa.bluez5: Failure in Bluetooth audio transport ...` with
+  `SYSLOG_IDENTIFIER=wireplumber`, not a `bluetoothd` line. A watcher that only
+  follows `bluetoothd` and the kernel cannot see it. The SCO line is a kernel
+  line: `Bluetooth: hci0: SCO packet for unknown connection handle N`.
+- **Stream volumes are linear, not decibels.** A corrected stream has
+  `channelVolumes: [0.199520, 1.000000]`, which is 14 dB below the right
+  channel. A flat stream has `[1.0, 1.0]`. The sink has its own volumes
+  (`[0.140608, 0.140608]` in the capture); the balance correction lives on the
+  stream nodes.
+- **A stream's sink comes from two places.** `target.object` names it when the
+  application sets one (`Sober`). When it is absent (`Meiro`), the Link objects
+  connect the stream's output node to the sink's node.
 - **The per-codec switches were written against PipeWire 1.6.9.** The machine
   now runs 1.6.11. Recheck `bluez5.codecs` before you rely on those switches.
 - **The earbud battery is not on D-Bus today.** `org.bluez.Battery1` is absent
@@ -146,13 +231,15 @@ These are measured on this machine, not assumed.
 ## Layout
 
 ```
-src/main.rs      CLI glue and the two views
+src/main.rs      CLI glue and the read-only views
 src/cli.rs       clap surface
 src/pw.rs        pw-dump parser and live snapshot
+src/watch.rs     the streaming monitor, journal and observer
 src/store.rs     SQLite schema and queries
 src/duration.rs  --since spans
 src/paths.rs     state directory
-tests/fixtures/  real pw-dump captures
+systemd/         the user unit, not installed by this repo
+tests/fixtures/  real pw-dump and journal captures
 policy/          WirePlumber Lua policy, later
 widget/          DMS bar widget, later
 ```
@@ -165,17 +252,31 @@ cargo test
 cargo clippy --all-targets -- -D warnings
 cargo fmt --check
 ./target/debug/btguard status
+./target/debug/btguard watch
 ./target/debug/btguard incidents --since 3d
 ```
 
+## Run it as a user service
+
+The unit is `systemd/btguard-watch.service`. This repository does not install
+or enable it.
+
+```
+cargo build --release
+install -Dm755 target/release/btguard ~/.local/bin/btguard
+install -Dm644 systemd/btguard-watch.service ~/.config/systemd/user/btguard-watch.service
+systemctl --user daemon-reload
+systemctl --user enable --now btguard-watch.service
+```
+
+The unit runs `Restart=always` with `RestartSec=3`, like
+`earbud-balance.service`, and uses `KillMode=control-group` so a stop also stops
+`pw-dump` and `journalctl`.
+
 ## Next
 
-1. `btguard watch`: read `pw-dump --monitor` and `journalctl -f`, then write
-   rows.
-2. A systemd user unit with `Restart=always` and `RestartSec=3`, like
-   `earbud-balance.service`.
-3. The Lua policy in `policy/`.
-4. The DMS widget in `widget/`.
+1. The Lua policy in `policy/`.
+2. The DMS widget in `widget/`.
 
 ## Open questions
 
